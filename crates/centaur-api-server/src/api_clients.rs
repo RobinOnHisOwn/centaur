@@ -450,6 +450,44 @@ impl IntoResponse for OAuthError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn terminal_discovery_and_state_keep_the_client_namespace_boundary() {
+        let client = ApiClientContext {
+            id: 1,
+            client_id: "acl_one".to_owned(),
+        };
+        assert!(crate::routes::api_client_may_touch(
+            &client,
+            "/api/sessions",
+            None
+        ));
+        assert!(crate::routes::api_client_may_touch(
+            &client,
+            "/api/session/{thread_key}/state",
+            Some(ThreadKey::parse("api:acl_one:work").unwrap())
+        ));
+        for key in [
+            "api:acl_two:work",
+            "api:acl_one_more:work",
+            "api:acl_one:",
+            "slack:channel:thread",
+        ] {
+            assert!(
+                !crate::routes::api_client_may_touch(
+                    &client,
+                    "/api/session/{thread_key}/state",
+                    Some(ThreadKey::parse(key).unwrap())
+                ),
+                "{key}"
+            );
+        }
+        assert!(!crate::routes::api_client_may_touch(
+            &client,
+            "/api/workflows/runs",
+            None
+        ));
+    }
+
     fn principal(id: i64, foreign_id: Option<&str>, default: bool) -> ApiClientPrincipal {
         ApiClientPrincipal {
             principal_id: id,
@@ -540,22 +578,29 @@ mod tests {
     }
 
     #[test]
-    fn clients_release_only_sandboxes_of_their_own_sessions() {
+    fn clients_change_lifecycle_only_in_their_own_namespace() {
         let client = ApiClientContext {
             id: 1,
             client_id: "acl_abc".to_owned(),
         };
-        let may_release = |key: &str| {
-            crate::routes::api_client_may_touch(
-                &client,
-                "/api/session/{thread_key}/sandbox",
-                Some(ThreadKey::parse(key).unwrap()),
-            )
-        };
-
-        assert!(may_release("api:acl_abc:eval-1"));
-        assert!(!may_release("api:acl_other:eval-1"));
-        assert!(!may_release("slack:T1:C1:1.2"));
+        for route in [
+            "/api/session/{thread_key}/sandbox",
+            "/api/session/{thread_key}",
+            "/api/session/{thread_key}/archive",
+            "/api/session/{thread_key}/prune",
+        ] {
+            let may_touch = |key: &str| {
+                crate::routes::api_client_may_touch(
+                    &client,
+                    route,
+                    Some(ThreadKey::parse(key).unwrap()),
+                )
+            };
+            assert!(may_touch("api:acl_abc:eval-1"));
+            assert!(!may_touch("api:acl_other:eval-1"));
+            assert!(!may_touch("api:acl_abcd:eval-1"));
+            assert!(!may_touch("slack:T1:C1:1.2"));
+        }
     }
 
     #[test]

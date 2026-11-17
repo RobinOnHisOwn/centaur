@@ -35,8 +35,36 @@ Disabling a client rejects all of its access tokens the same way.
 
 ## Get an access token
 
-Expose `/oauth/token` and `/api/session/*` on api-rs to the client, for example
-through `httpRoutes`. Keep other api-rs routes internal.
+Expose `/oauth/token`, `/api/sessions` and `/api/session/*` on api-rs to the
+client, for example through `httpRoutes`. Keep other api-rs routes internal.
+`GET /api/sessions` discovers only the authenticated client's sessions, with
+100-item pages and an `after_thread_key` cursor. `GET /api/session/{thread_key}/state`
+reads durable session/execution state and submitted messages without creating
+or restarting a sandbox. Both need `sessions:read`. Archived sessions are hidden
+by default; `include_archived=true` includes them without changing namespace or
+pagination rules.
+
+`POST /api/session/{thread_key}/archive` with `{"archived":true}` hides an idle
+session; `false` restores it. This preserves history and sandbox files, and is
+not an access-control restriction on exact-key operations.
+`DELETE /api/session/{thread_key}` permanently removes an idle session's stored
+history and sandbox; it is distinct from sandbox-only release. Both require
+`sessions:write`, enforce the client's namespace, and refuse queued/running or
+workflow-owned sessions. Failed sandbox cleanup preserves the database record
+for retry; partial filesystem cleanup may already have occurred. External logs,
+backups and account credentials are outside the deletion scope.
+
+`GET /api/sessions?prunable_only=true` previews the authenticated client's inactive
+sessions with no activity in the last 30 × 24 hours, including archived ones. It
+keeps the same cursor pagination and returns `prune_older_than_days: 30` to
+identify the safety contract. Activity includes session creation/changes,
+sandbox activity, messages, events and executions, evaluated by the database
+clock. Queued/running executions and workflow-owned sessions are excluded before
+pagination. The dedicated `DELETE /api/session/{thread_key}/prune` rechecks
+inactivity, ownership and age under the deletion row lock; a now-recent session
+returns `{"deleted":false}` without cleanup. Busy/workflow sessions return 409.
+It requires `sessions:write` and the same namespace boundary as delete. Clients
+must not substitute unconditional delete or silently accept an old preview API.
 
 ```bash
 TOKEN=$(curl -s -u "$CLIENT_ID:$CLIENT_SECRET" \

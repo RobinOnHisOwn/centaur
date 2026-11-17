@@ -2,6 +2,8 @@ mod api_clients;
 mod api_jwt;
 mod auth;
 pub mod client;
+#[cfg(test)]
+mod client_tests;
 mod error;
 mod mcp;
 mod routes;
@@ -55,6 +57,21 @@ mod tests {
         ApiAuthConfig, AppState, build_router_with_app_state,
         build_router_with_runtime as build_router_with_iron_control,
     };
+
+    async fn test_store() -> Option<PgSessionStore> {
+        let Ok(url) = std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL") else {
+            return None;
+        };
+        // Concurrent fresh-database migrators can deadlock around CONCURRENTLY indexes.
+        static MIGRATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = MIGRATION_LOCK.lock().await;
+        let store = PgSessionStore::connect(&url).await.unwrap();
+        store
+            .run_migrations(centaur_session_sqlx::TextSearchBackend::Postgres)
+            .await
+            .unwrap();
+        Some(store)
+    }
 
     fn test_auth() -> ApiAuthConfig {
         ApiAuthConfig::testing("test-secret")
@@ -546,6 +563,192 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), expected, "{method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn prune_http_rechecks_recent_and_active_sessions() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let key = centaur_session_core::ThreadKey::parse(format!(
+            "api:acl_{}:prune-http",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+        store
+            .create_or_get_session(
+                &key,
+                &centaur_session_core::HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let app = build_router_with_runtime(
+            store.clone(),
+            SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
+        );
+        let request = || {
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!(
+                    "/api/session/{}/prune",
+                    urlencoding::encode(key.as_str())
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {}", console_token()))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let response = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["deleted"], false);
+        let execution = store
+            .create_execution(&key, None, json!({}))
+            .await
+            .unwrap()
+            .execution;
+        assert_eq!(
+            app.clone().oneshot(request()).await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+        store
+            .complete_execution(&execution.execution_id)
+            .await
+            .unwrap();
+        sqlx::query("update sessions set created_at = now() - interval '744 hours', updated_at = now() - interval '744 hours' where thread_key = $1")
+            .bind(key.as_str()).execute(store.pool()).await.unwrap();
+        sqlx::query("update session_executions set updated_at = now() - interval '744 hours' where thread_key = $1")
+            .bind(key.as_str()).execute(store.pool()).await.unwrap();
+        let response = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["deleted"], true);
+        assert!(store.get_session(&key).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn session_lifecycle_http_contract_uses_real_postgres() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let key = centaur_session_core::ThreadKey::parse(format!(
+            "api:acl_{}:http-lifecycle",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+        store
+            .create_or_get_session(
+                &key,
+                &centaur_session_core::HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let app = build_router_with_runtime(
+            store.clone(),
+            SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
+        );
+        let path = format!("/api/session/{}", urlencoding::encode(key.as_str()));
+        for archived in [true, false] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("{path}/archive"))
+                        .header(header::AUTHORIZATION, format!("Bearer {}", console_token()))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(json!({"archived": archived}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                store
+                    .list_client_sessions(key.as_str(), "")
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                archived
+            );
+        }
+        let execution = store
+            .create_execution(&key, None, json!({}))
+            .await
+            .unwrap()
+            .execution;
+        store
+            .mark_execution_running(&execution.execution_id)
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(&path)
+                    .header(header::AUTHORIZATION, format!("Bearer {}", console_token()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        store
+            .complete_execution(&execution.execution_id)
+            .await
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(&path)
+                    .header(header::AUTHORIZATION, format!("Bearer {}", console_token()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(matches!(
+            store.get_session(&key).await,
+            Err(centaur_session_sqlx::SessionStoreError::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn sandbox_principals_cannot_delete_or_archive_sessions() {
+        for (method, suffix, body) in [
+            (Method::DELETE, "", ""),
+            (Method::DELETE, "/prune", ""),
+            (Method::POST, "/archive", r#"{"archived":true}"#),
+        ] {
+            let response = build_router_with_app_state(AppState::unready(test_auth()))
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(format!("/api/session/api%3Aacl_one%3Aold{suffix}"))
+                        .header(
+                            header::AUTHORIZATION,
+                            format!("Bearer {}", principal_token("prn_sandbox")),
+                        )
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
         }
     }
 
@@ -1105,6 +1308,74 @@ mod tests {
         assert!(body.get("slack").is_none());
         assert!(body.get("discord").is_none());
         assert!(body.get("linear").is_none());
+    }
+
+    #[tokio::test]
+    async fn public_pi_creation_and_durable_state_read_use_the_existing_runtime() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let key = format!("api:acl_terminal:{}", uuid::Uuid::new_v4().simple());
+        let path = format!("/api/session/{}", urlencoding::encode(&key));
+        let app = build_router_with_runtime(
+            store.clone(),
+            SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&path)
+                    .header(header::AUTHORIZATION, format!("Bearer {}", console_token()))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"harness_type":"pi"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let key = centaur_session_core::ThreadKey::parse(key).unwrap();
+        store
+            .append_messages(
+                &key,
+                &[centaur_session_core::SessionMessageInput {
+                    client_message_id: Some("prompt-1".to_owned()),
+                    role: centaur_session_core::MessageRole::User,
+                    parts: vec![json!({"type":"text","text":"remember this"})],
+                    metadata: json!({}),
+                }],
+            )
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{path}/state"))
+                    .header(header::AUTHORIZATION, format!("Bearer {}", console_token()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let state: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(state["session"]["harness_type"], "pi");
+        assert_eq!(state["messages"][0]["parts"][0]["text"], "remember this");
+        assert!(state["execution"].is_null());
+        assert_eq!(state["last_event_id"], 0);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{path}/state"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[derive(Default)]

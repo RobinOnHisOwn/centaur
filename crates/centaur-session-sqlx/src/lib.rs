@@ -28,6 +28,11 @@ pub use migrations::{TextSearchBackend, migrate, migration_list};
 
 pub const SESSION_EVENTS_CHANNEL: &str = "centaur_session_events";
 const DEFAULT_MAX_CONNECTIONS: u32 = 500;
+// ponytail: aggregate retained activity; use an indexed watermark if large histories make pruning slow.
+const SESSION_ACTIVITY_SQL: &str = r#"greatest(s.created_at, s.updated_at, s.sandbox_last_active_at,
+    (select max(updated_at) from session_executions where thread_key = s.thread_key),
+    (select max(created_at) from session_messages where thread_key = s.thread_key),
+    (select max(created_at) from session_events where thread_key = s.thread_key))"#;
 
 #[derive(Clone, Debug)]
 pub struct CreateExecutionResult {
@@ -297,6 +302,93 @@ impl PgSessionStore {
         })?;
 
         row.try_into()
+    }
+
+    pub async fn last_event_id(&self, key: &ThreadKey) -> Result<i64, SessionStoreError> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "select coalesce(max(event_id), 0) from session_events where thread_key = $1",
+        )
+        .bind(key.as_str())
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// Discovery is always constrained to the authenticated client's literal prefix.
+    pub async fn list_client_sessions(
+        &self,
+        prefix: &str,
+        after: &str,
+    ) -> Result<Vec<Value>, SessionStoreError> {
+        self.list_client_sessions_with_archived(prefix, after, false)
+            .await
+    }
+
+    pub async fn list_client_sessions_with_archived(
+        &self,
+        prefix: &str,
+        after: &str,
+        include_archived: bool,
+    ) -> Result<Vec<Value>, SessionStoreError> {
+        self.list_client_sessions_filtered(prefix, after, include_archived, false)
+            .await
+    }
+
+    pub async fn list_prunable_sessions(
+        &self,
+        prefix: &str,
+        after: &str,
+    ) -> Result<Vec<Value>, SessionStoreError> {
+        self.list_client_sessions_filtered(prefix, after, true, true)
+            .await
+    }
+
+    async fn list_client_sessions_filtered(
+        &self,
+        prefix: &str,
+        after: &str,
+        include_archived: bool,
+        prunable_only: bool,
+    ) -> Result<Vec<Value>, SessionStoreError> {
+        Ok(sqlx::query_scalar::<_, Value>(&format!(
+            r#"
+            select jsonb_build_object(
+                'thread_key', s.thread_key, 'harness_type', s.harness_type,
+                'status', coalesce(e.status, 'idle'),
+                'archived', coalesce(s.metadata->>'archived' = 'true', false),
+                'updated_at', {SESSION_ACTIVITY_SQL}, 'error', e.error)
+            from sessions s
+            left join lateral (
+                select status, updated_at, error from session_executions
+                where thread_key = s.thread_key order by created_at desc, execution_id desc limit 1
+            ) e on true
+            where starts_with(s.thread_key, $1) and s.thread_key > $2
+              and ($3 or coalesce(s.metadata->>'archived', 'false') <> 'true')
+              and (not $4 or (
+                {SESSION_ACTIVITY_SQL} < now() - interval '720 hours'
+                and coalesce(s.metadata->>'workflow_owned_thread', 'false') <> 'true'
+                and not exists (select 1 from session_executions
+                    where thread_key = s.thread_key and status in ('queued', 'running'))
+              ))
+            order by s.thread_key limit 100
+        "#
+        ))
+        .bind(prefix)
+        .bind(after)
+        .bind(include_archived)
+        .bind(prunable_only)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Recheck age while the caller holds lock_idle_session's row lock.
+    pub async fn session_old_enough_to_prune(
+        &self,
+        key: &ThreadKey,
+        tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    ) -> Result<bool, SessionStoreError> {
+        Ok(sqlx::query_scalar::<_, bool>(&format!(
+            "select {SESSION_ACTIVITY_SQL} < now() - interval '720 hours' from sessions s where s.thread_key = $1"
+        )).bind(key.as_str()).fetch_one(&mut **tx).await?)
     }
 
     pub async fn get_session_title(
@@ -1590,19 +1682,13 @@ impl PgSessionStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Detach the session's sandbox when no turn is queued or running, and
-    /// return the detached id (`None` if the session had no sandbox). Its
-    /// warm-pool row, if any, leaves the pool in the same transaction so the
-    /// detached sandbox is unreferenced even if the caller never stops it.
-    /// A workflow-owned session is refused: its run keeps the sandbox between
-    /// agent steps and stops it when the run ends. Locking
-    /// the session row blocks a concurrent execution insert at its foreign-key
-    /// check, so a new turn either is seen here and refused, or starts after
-    /// the detach and provisions a fresh sandbox.
-    pub async fn detach_idle_session_sandbox(
+    /// Lock an idle, non-workflow session for a lifecycle change. The row lock
+    /// blocks new execution inserts at their foreign-key check until commit.
+    pub async fn lock_idle_session(
         &self,
         thread_key: &ThreadKey,
-    ) -> Result<Option<String>, SessionStoreError> {
+    ) -> Result<(sqlx::Transaction<'static, sqlx::Postgres>, Option<String>), SessionStoreError>
+    {
         let mut tx = self.pool.begin().await?;
         let (sandbox_id, workflow_owned) = sqlx::query_as::<_, (Option<String>, bool)>(
             r#"
@@ -1642,6 +1728,44 @@ impl PgSessionStore {
                 execution_id,
             });
         }
+        Ok((tx, sandbox_id))
+    }
+
+    pub async fn set_session_archived(
+        &self,
+        key: &ThreadKey,
+        archived: bool,
+    ) -> Result<(), SessionStoreError> {
+        let (mut tx, _) = self.lock_idle_session(key).await?;
+        sqlx::query("update sessions set metadata = jsonb_set(metadata, '{archived}', to_jsonb($2::boolean)), updated_at = now() where thread_key = $1")
+            .bind(key.as_str()).bind(archived).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Consume the lock obtained by lock_idle_session after sandbox cleanup.
+    /// Existing foreign keys cascade messages, executions and events.
+    pub async fn delete_locked_session(
+        &self,
+        key: &ThreadKey,
+        mut tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    ) -> Result<(), SessionStoreError> {
+        sqlx::query("update session_warm_sandboxes set status = 'failed', last_error = 'session deleted', updated_at = now() where claimed_thread_key = $1")
+            .bind(key.as_str()).execute(&mut *tx).await?;
+        sqlx::query("delete from sessions where thread_key = $1")
+            .bind(key.as_str())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Detach an idle sandbox atomically; retain the session and history.
+    pub async fn detach_idle_session_sandbox(
+        &self,
+        thread_key: &ThreadKey,
+    ) -> Result<Option<String>, SessionStoreError> {
+        let (mut tx, sandbox_id) = self.lock_idle_session(thread_key).await?;
         let Some(sandbox_id) = sandbox_id else {
             return Ok(None);
         };
@@ -2408,6 +2532,8 @@ mod tests {
     use super::{IdleSandboxCandidateRow, PgSessionStore, SessionEventNotification};
 
     async fn test_store() -> Option<PgSessionStore> {
+        static MIGRATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _migration_guard = MIGRATION_LOCK.lock().await;
         let Ok(url) = std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL") else {
             eprintln!("skipping: SESSION_RUNTIME_TEST_DATABASE_URL not set");
             return None;
@@ -2420,6 +2546,263 @@ mod tests {
             .await
             .expect("run migrations");
         Some(store)
+    }
+
+    #[tokio::test]
+    async fn terminal_discovery_is_literal_scoped_paginated_and_execution_aware() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let prefix = format!("api:acl_{}:", Uuid::new_v4().simple());
+        let other_prefix = prefix.replace("acl_", "aclX");
+        for index in 0..102 {
+            let key = ThreadKey::parse(format!("{prefix}session-{index:03}")).unwrap();
+            store
+                .create_or_get_session(&key, &HarnessType::Pi, None, json!({}), BTreeMap::new())
+                .await
+                .unwrap();
+        }
+        let other = ThreadKey::parse(format!("{other_prefix}other")).unwrap();
+        store
+            .create_or_get_session(&other, &HarnessType::Pi, None, json!({}), BTreeMap::new())
+            .await
+            .unwrap();
+        let key = ThreadKey::parse(format!("{prefix}session-000")).unwrap();
+        let execution = store
+            .create_execution(&key, Some("test-request"), json!({}))
+            .await
+            .unwrap();
+        store
+            .append_event(
+                &key,
+                Some(&execution.execution.execution_id),
+                "session.execution_started",
+                json!({}),
+            )
+            .await
+            .unwrap();
+        let first = store.list_client_sessions(&prefix, "").await.unwrap();
+        assert_eq!(first.len(), 100);
+        assert_eq!(first[0]["status"], "queued");
+        assert_eq!(first[0]["harness_type"], "pi");
+        assert!(
+            first
+                .iter()
+                .all(|item| item["thread_key"].as_str().unwrap().starts_with(&prefix))
+        );
+        let last = first.last().unwrap()["thread_key"].as_str().unwrap();
+        let second = store.list_client_sessions(&prefix, last).await.unwrap();
+        assert_eq!(second.len(), 2);
+        assert_ne!(first[0]["thread_key"], second[0]["thread_key"]);
+        assert!(store.last_event_id(&key).await.unwrap() > 0);
+        assert_eq!(store.last_event_id(&other).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn prune_filters_activity_ownership_and_busy_state_before_pagination() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let prefix = format!("api:acl_{}:", Uuid::new_v4().simple());
+        let key = |name: &str| ThreadKey::parse(format!("{prefix}{name}")).unwrap();
+        for index in 0..102 {
+            store
+                .create_or_get_session(
+                    &key(&format!("old-{index:03}")),
+                    &HarnessType::Codex,
+                    None,
+                    json!({"archived": index == 3}),
+                    BTreeMap::new(),
+                )
+                .await
+                .unwrap();
+        }
+        for name in [
+            "busy",
+            "workflow",
+            "recent",
+            "message",
+            "event",
+            "execution",
+            "sandbox",
+        ] {
+            store
+                .create_or_get_session(
+                    &key(name),
+                    &HarnessType::Codex,
+                    None,
+                    json!({"workflow_owned_thread": name == "workflow"}),
+                    BTreeMap::new(),
+                )
+                .await
+                .unwrap();
+        }
+        let busy = store
+            .create_execution(&key("busy"), None, json!({}))
+            .await
+            .unwrap()
+            .execution;
+        let finished = store
+            .create_execution(&key("execution"), None, json!({}))
+            .await
+            .unwrap()
+            .execution;
+        store
+            .complete_execution(&finished.execution_id)
+            .await
+            .unwrap();
+        store
+            .append_messages(
+                &key("message"),
+                &[centaur_session_core::SessionMessageInput {
+                    client_message_id: None,
+                    role: centaur_session_core::MessageRole::User,
+                    parts: vec![json!({"type":"text", "text":"recent"})],
+                    metadata: json!({}),
+                }],
+            )
+            .await
+            .unwrap();
+        store
+            .append_event(&key("event"), None, "recent.event", json!({}))
+            .await
+            .unwrap();
+        sqlx::query("update sessions set created_at = now() - interval '744 hours', updated_at = now() - interval '744 hours' where starts_with(thread_key, $1)")
+            .bind(&prefix).execute(store.pool()).await.unwrap();
+        sqlx::query("update session_executions set updated_at = now() - interval '744 hours' where execution_id = $1")
+            .bind(&busy.execution_id).execute(store.pool()).await.unwrap();
+        sqlx::query(
+            "update sessions set updated_at = now() - interval '696 hours' where thread_key = $1",
+        )
+        .bind(key("recent").as_str())
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query("update sessions set sandbox_last_active_at = now() where thread_key = $1")
+            .bind(key("sandbox").as_str())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        // A different API client's namespace must never enter the candidate set.
+        let other =
+            ThreadKey::parse(format!("{}other", prefix.replace("api:acl_", "api:aclX_"))).unwrap();
+        store
+            .create_or_get_session(
+                &other,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+        sqlx::query("update sessions set created_at = now() - interval '744 hours', updated_at = now() - interval '744 hours' where thread_key = $1")
+            .bind(other.as_str()).execute(store.pool()).await.unwrap();
+        let first = store.list_prunable_sessions(&prefix, "").await.unwrap();
+        assert_eq!(first.len(), 100);
+        assert!(first.iter().all(|s| {
+            s["thread_key"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("{prefix}old-"))
+        }));
+        assert!(first.iter().any(|s| s["archived"] == true));
+        let second = store
+            .list_prunable_sessions(
+                &prefix,
+                first.last().unwrap()["thread_key"].as_str().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn archived_sessions_are_hidden_from_default_discovery() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let prefix = format!("api:acl_{}:", Uuid::new_v4().simple());
+        let key = ThreadKey::parse(format!("{prefix}archived")).unwrap();
+        store
+            .create_or_get_session(
+                &key,
+                &HarnessType::Codex,
+                None,
+                json!({"archived": true}),
+                BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .list_client_sessions(&prefix, "")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store.get_session(&key).await.is_ok(),
+            "archive must preserve the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_lock_blocks_concurrent_execution_and_workflow_owned_changes() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let key =
+            ThreadKey::parse(format!("api:acl_{}:delete-race", Uuid::new_v4().simple())).unwrap();
+        store
+            .create_or_get_session(&key, &HarnessType::Codex, None, json!({}), BTreeMap::new())
+            .await
+            .unwrap();
+        let (tx, _) = store.lock_idle_session(&key).await.unwrap();
+        let other_store = store.clone();
+        let other_key = key.clone();
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let notify = started.clone();
+        let mut queued = tokio::spawn(async move {
+            notify.notify_one();
+            other_store
+                .create_execution(&other_key, None, json!({}))
+                .await
+        });
+        started.notified().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut queued)
+                .await
+                .is_err(),
+            "execution must wait for deletion's row lock"
+        );
+        store.delete_locked_session(&key, tx).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), queued)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err(),
+            "deleted session cannot gain an execution"
+        );
+        let owned =
+            ThreadKey::parse(format!("api:acl_{}:workflow", Uuid::new_v4().simple())).unwrap();
+        store
+            .create_or_get_session(
+                &owned,
+                &HarnessType::Codex,
+                None,
+                json!({"workflow_owned_thread":true}),
+                BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.lock_idle_session(&owned).await,
+            Err(super::SessionStoreError::WorkflowOwnedSandbox { .. })
+        ));
+        assert!(store.set_session_archived(&owned, true).await.is_err());
+        assert!(store.get_session(&owned).await.is_ok());
     }
 
     #[tokio::test]

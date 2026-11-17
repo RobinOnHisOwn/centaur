@@ -646,6 +646,7 @@ impl SessionExecutionAttemptError {
 struct SessionPipe {
     stdin: Arc<Mutex<SessionInputSink>>,
     instance_id: Option<String>,
+    stdout_pump: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 #[derive(Serialize)]
@@ -905,6 +906,108 @@ impl SessionRuntime {
     /// Load the durable session for API resource authorization.
     pub async fn session(&self, thread_key: &ThreadKey) -> Result<Session, SessionRuntimeError> {
         Ok(self.store.get_session(thread_key).await?)
+    }
+
+    pub async fn list_client_sessions(
+        &self,
+        prefix: &str,
+        after: &str,
+    ) -> Result<Vec<Value>, SessionRuntimeError> {
+        Ok(self.store.list_client_sessions(prefix, after).await?)
+    }
+
+    pub async fn list_client_sessions_with_archived(
+        &self,
+        prefix: &str,
+        after: &str,
+        include_archived: bool,
+    ) -> Result<Vec<Value>, SessionRuntimeError> {
+        Ok(self
+            .store
+            .list_client_sessions_with_archived(prefix, after, include_archived)
+            .await?)
+    }
+
+    pub async fn list_prunable_sessions(
+        &self,
+        prefix: &str,
+        after: &str,
+    ) -> Result<Vec<Value>, SessionRuntimeError> {
+        Ok(self.store.list_prunable_sessions(prefix, after).await?)
+    }
+
+    pub async fn set_session_archived(
+        &self,
+        key: &ThreadKey,
+        archived: bool,
+    ) -> Result<(), SessionRuntimeError> {
+        Ok(self.store.set_session_archived(key, archived).await?)
+    }
+
+    /// Stop the sandbox before committing the cascading history deletion.
+    /// A cleanup failure rolls back and keeps the session retryable.
+    pub async fn delete_session(&self, key: &ThreadKey) -> Result<(), SessionRuntimeError> {
+        self.delete_session_checked(key, false).await?;
+        Ok(())
+    }
+
+    pub async fn prune_session(&self, key: &ThreadKey) -> Result<bool, SessionRuntimeError> {
+        self.delete_session_checked(key, true).await
+    }
+
+    async fn delete_session_checked(
+        &self,
+        key: &ThreadKey,
+        prunable_only: bool,
+    ) -> Result<bool, SessionRuntimeError> {
+        // ponytail: hold one row lock during sandbox stop; use an outbox if cleanup latency becomes a problem.
+        let (mut tx, sandbox_id) = self.store.lock_idle_session(key).await?;
+        if prunable_only && !self.store.session_old_enough_to_prune(key, &mut tx).await? {
+            return Ok(false);
+        }
+        if let Some(sandbox_id) = sandbox_id {
+            let id = SandboxId::new(sandbox_id.clone());
+            let stopped = tokio::time::timeout(
+                Duration::from_secs(90),
+                self.sandbox_runtime.manager.stop(&id),
+            )
+            .await
+            .map_err(|_| {
+                SandboxError::backend("session deletion cleanup timed out; history retained")
+            })?;
+            match stopped {
+                Ok(()) | Err(SandboxError::NotFound(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+            if let Some((_, pipe)) = self.sandbox_pipes.remove(&sandbox_id) {
+                let pump = pipe
+                    .stdout_pump
+                    .lock()
+                    .expect("stdout pump lock poisoned")
+                    .take();
+                if let Some(pump) = pump {
+                    pump.abort();
+                    let _ = pump.await;
+                }
+            }
+        }
+        self.store.delete_locked_session(key, tx).await?;
+        Ok(true)
+    }
+
+    pub async fn session_state(&self, key: &ThreadKey) -> Result<Value, SessionRuntimeError> {
+        let session = self.store.get_session(key).await?;
+        let execution = self
+            .store
+            .active_execution_for_thread(key)
+            .await?
+            .or(self.store.latest_execution_for_thread(key).await?);
+        Ok(json!({
+            "session": session,
+            "execution": execution,
+            "messages": self.store.list_messages(key).await?,
+            "last_event_id": self.store.last_event_id(key).await?,
+        }))
     }
 
     fn resolve_stored_persona(
@@ -2574,7 +2677,7 @@ impl SessionRuntime {
             execution_trace_span.record("sandbox_id", sandbox_id.as_str());
 
             let pipe = match self
-                .ensure_session_pipe(thread_key, &sandbox_id)
+                .renew_session_pipe(thread_key, &sandbox_id)
                 .instrument(execution_trace_span.clone())
                 .await
             {
@@ -3696,6 +3799,38 @@ impl SessionRuntime {
         Ok(())
     }
 
+    /// A cached Kubernetes attach can accept buffered writes without delivering
+    /// them to the harness. Renew it before dispatching a new execution, never
+    /// during a turn or by replaying input. The sandbox process stays alive.
+    async fn renew_session_pipe(
+        &self,
+        thread_key: &ThreadKey,
+        sandbox_id: &str,
+    ) -> Result<SessionPipe, SessionRuntimeError> {
+        let open_lock = self
+            .sandbox_pipe_open_locks
+            .entry(sandbox_id.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        {
+            let _open_guard = open_lock.lock().await;
+            if let Some((_, pipe)) = self.sandbox_pipes.remove(sandbox_id) {
+                let pump = pipe
+                    .stdout_pump
+                    .lock()
+                    .expect("stdout pump lock poisoned")
+                    .take();
+                if let Some(pump) = pump {
+                    pump.abort();
+                    // Drop the old IO guard before opening another attach, so
+                    // two pumps cannot persist the same output concurrently.
+                    let _ = pump.await;
+                }
+            }
+        }
+        self.ensure_session_pipe(thread_key, sandbox_id).await
+    }
+
     async fn ensure_session_pipe(
         &self,
         thread_key: &ThreadKey,
@@ -3760,7 +3895,8 @@ impl SessionRuntime {
 
             self.sandbox_pipes
                 .insert(sandbox_id.to_owned(), pipe.clone());
-            drop(_open_guard);
+            // Keep the open lock until the pump handle is registered, so a
+            // concurrent renewal cannot leave an untracked reader running.
             let ctx = self.context();
             let thread_key = thread_key.clone();
             let pump_thread_key = thread_key.clone();
@@ -3773,7 +3909,7 @@ impl SessionRuntime {
 
             spawn_stdout_pump_loop(StdoutPumpLoop {
                 ctx,
-                open_lock,
+                open_lock: Arc::clone(&open_lock),
                 thread_key: pump_thread_key,
                 sandbox_id: pump_key,
                 pipe: pump_pipe,
@@ -4755,7 +4891,13 @@ fn session_event_stream(
                         )
                         .await
                     {
-                        Ok(events) if events.is_empty() => loop {
+                        Ok(events) if events.is_empty() => {
+                            match state.store.get_session(&state.thread_key).await {
+                                Ok(_) => {}
+                                Err(SessionStoreError::NotFound { .. }) => return None,
+                                Err(error) => return Some((Err(SessionRuntimeError::Store(error)), state)),
+                            }
+                            loop {
                             tokio::select! {
                                 notification = state.listener.recv() => {
                                     match notification {
@@ -4773,6 +4915,7 @@ fn session_event_stream(
                                     }
                                 }
                                 _ = state.safety_tick.tick() => break,
+                            }
                             }
                         }
                         Ok(events) => state.pending = events.into(),
@@ -4838,6 +4981,7 @@ fn session_pipe_from_parts(stdin: SandboxWrite, instance_id: Option<String>) -> 
     SessionPipe {
         stdin: Arc::new(Mutex::new(FramedWrite::new(stdin, LinesCodec::new()))),
         instance_id,
+        stdout_pump: Default::default(),
     }
 }
 
@@ -4886,7 +5030,8 @@ fn remove_pipe_if_current(sandbox_pipes: &SessionPipeMap, sandbox_id: &str, pipe
 /// Runs the stdout pump and reattaches when Kubernetes closes the attach
 /// stream before the active execution emits terminal output.
 fn spawn_stdout_pump_loop(state: StdoutPumpLoop) {
-    tokio::spawn(async move {
+    let stdout_pump = Arc::clone(&state.pipe.stdout_pump);
+    let task = tokio::spawn(async move {
         let StdoutPumpLoop {
             ctx,
             open_lock,
@@ -5062,6 +5207,7 @@ fn spawn_stdout_pump_loop(state: StdoutPumpLoop) {
 
         remove_pipe_if_current(&ctx.sandbox_pipes, &sandbox_id, &pipe);
     });
+    *stdout_pump.lock().expect("stdout pump lock poisoned") = Some(task);
 }
 
 async fn reattach_session_pipe(
@@ -5113,7 +5259,8 @@ async fn reattach_session_pipe(
                                 "sandbox became ready while reattaching session stdout pump"
                             );
                         }
-                        let new_pipe = session_pipe_from_parts(parts.stdin, parts.instance_id);
+                        let mut new_pipe = session_pipe_from_parts(parts.stdin, parts.instance_id);
+                        new_pipe.stdout_pump = Arc::clone(&pipe.stdout_pump);
                         ctx.sandbox_pipes
                             .insert(sandbox_id.to_owned(), new_pipe.clone());
                         spawn_stderr_drain(sandbox_id.to_owned(), parts.stderr);
@@ -9863,6 +10010,7 @@ mod adoption_tests {
         created_observed: tokio::sync::Notify,
         observed_statuses: std::sync::Mutex<BTreeMap<String, SandboxStatus>>,
         create_id: String,
+        create_counter: Option<AtomicUsize>,
         created_specs: std::sync::Mutex<Vec<SandboxSpec>>,
         resume_fails: AtomicBool,
         stop_fails: AtomicBool,
@@ -9887,6 +10035,7 @@ mod adoption_tests {
                 created_observed: tokio::sync::Notify::new(),
                 observed_statuses: std::sync::Mutex::new(BTreeMap::new()),
                 create_id: "mock-sbx".to_owned(),
+                create_counter: None,
                 created_specs: std::sync::Mutex::new(Vec::new()),
                 resume_fails: AtomicBool::new(false),
                 stop_fails: AtomicBool::new(false),
@@ -9999,11 +10148,16 @@ mod adoption_tests {
             if let Some(gate) = gate {
                 gate.notified().await;
             }
-            self.set_observed_status(&self.create_id, SandboxStatus::Running);
-            Ok(SandboxHandle::new(
-                SandboxId::new(self.create_id.clone()),
-                "mock",
-            ))
+            let id = match &self.create_counter {
+                Some(counter) => format!(
+                    "{}-{}",
+                    self.create_id,
+                    counter.fetch_add(1, Ordering::SeqCst)
+                ),
+                None => self.create_id.clone(),
+            };
+            self.set_observed_status(&id, SandboxStatus::Running);
+            Ok(SandboxHandle::new(SandboxId::new(id), "mock"))
         }
 
         async fn open_io(&self, _id: &SandboxId) -> SandboxResult<SandboxIo> {
@@ -10150,6 +10304,8 @@ mod adoption_tests {
     }
 
     async fn test_store() -> Option<PgSessionStore> {
+        static MIGRATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _migration_guard = MIGRATION_LOCK.lock().await;
         let Ok(url) = std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL") else {
             eprintln!("skipping: SESSION_RUNTIME_TEST_DATABASE_URL not set");
             return None;
@@ -10782,6 +10938,104 @@ mod adoption_tests {
             .expect("execution exists");
         assert_eq!(latest.execution_id, execution.execution_id);
         assert_eq!(latest.status, ExecutionStatus::Completed);
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_pi_sessions_continue_after_readers_disconnect_and_replay_independently() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let keys = [
+            ThreadKey::parse(format!("api:terminal:{}-a", uuid::Uuid::new_v4())).unwrap(),
+            ThreadKey::parse(format!("api:terminal:{}-b", uuid::Uuid::new_v4())).unwrap(),
+        ];
+        let mut backend = MockBackend::new(SandboxStatus::Running, Vec::new());
+        backend.create_counter = Some(AtomicUsize::new(0));
+        let backend = Arc::new(backend);
+        let mut outputs = Vec::new();
+        let mut inputs = Vec::new();
+        for _ in &keys {
+            let (io, stdout, stdin) = mock_io();
+            backend.push_io(io).await;
+            outputs.push(stdout);
+            inputs.push(stdin);
+        }
+        let runtime = runtime_with(&store, backend.clone());
+        for key in &keys {
+            store
+                .create_or_get_session(key, &HarnessType::Pi, None, json!({}), Default::default())
+                .await
+                .unwrap();
+            runtime.enqueue_session_execution(key, ExecuteSessionInput {
+                idempotency_key: Some("independent-request".to_owned()), metadata: None,
+                input_lines: vec![json!({"type":"user","message":{"content":[{"type":"text","text":"work"}]}}).to_string()],
+                idle_timeout_ms: None, max_duration_ms: None,
+            }).await.unwrap();
+            wait_for_event(&store, key, "session.execution_started").await;
+            let reader = runtime.stream_events(key, 0, None).await.unwrap();
+            drop(reader);
+        }
+        let first = store.get_session(&keys[0]).await.unwrap();
+        let second = store.get_session(&keys[1]).await.unwrap();
+        assert_ne!(first.sandbox_id, second.sandbox_id);
+        for key in &keys {
+            assert_eq!(
+                store
+                    .latest_execution_for_thread(key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                ExecutionStatus::Running
+            );
+        }
+        outputs[0]
+            .write_all(&completed_output_bytes("independent-alpha"))
+            .await
+            .unwrap();
+        outputs[1]
+            .write_all(&completed_output_bytes("independent-beta"))
+            .await
+            .unwrap();
+        let mut transcripts = Vec::new();
+        for key in &keys {
+            wait_for_event(&store, key, "session.execution_completed").await;
+            let execution = store
+                .latest_execution_for_thread(key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(execution.status, ExecutionStatus::Completed);
+            let replay = runtime
+                .stream_events(key, 0, Some(&execution.execution_id))
+                .await
+                .unwrap();
+            let events = timeout(Duration::from_secs(5), replay.collect::<Vec<_>>())
+                .await
+                .unwrap();
+            let events: Vec<_> = events.into_iter().map(Result::unwrap).collect();
+            assert!(events.iter().all(|event| &event.thread_key == key));
+            let last = events.last().unwrap().event_id;
+            assert!(
+                store
+                    .list_events_after(key, last, None, 100)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            transcripts.push(serde_json::to_string(&events).unwrap());
+        }
+        assert!(
+            transcripts
+                .iter()
+                .all(|text| text.contains("independent-alpha") ^ text.contains("independent-beta"))
+        );
+        assert_ne!(
+            transcripts[0].contains("independent-alpha"),
+            transcripts[1].contains("independent-alpha")
+        );
         reset_test_store(&store).await;
     }
 
@@ -12261,6 +12515,278 @@ mod adoption_tests {
         assert!(
             all.iter()
                 .any(|event| event.event_type == "session.sandbox_resume_failed")
+        );
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleting_session_closes_its_event_stream() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let key = ThreadKey::parse(format!(
+            "api:acl_{}:delete-stream",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        );
+        runtime
+            .create_or_get_session(
+                &key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .unwrap();
+        let stream = runtime
+            .stream_events(&key, store.last_event_id(&key).await.unwrap(), None)
+            .await
+            .unwrap();
+        tokio::pin!(stream);
+        runtime.delete_session(&key).await.unwrap();
+        assert!(
+            timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("deleted stream must close")
+                .is_none()
+        );
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prune_rechecks_age_before_stopping_a_previewed_sandbox() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let key =
+            ThreadKey::parse(format!("api:acl_{}:prune", uuid::Uuid::new_v4().simple())).unwrap();
+        store
+            .create_or_get_session(
+                &key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        store
+            .update_sandbox_id(&key, Some("prune-sbx"))
+            .await
+            .unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend.clone());
+        sqlx::query("update sessions set created_at = now() - interval '744 hours', updated_at = now() - interval '744 hours', sandbox_last_active_at = now() - interval '744 hours' where thread_key = $1")
+            .bind(key.as_str()).execute(store.pool()).await.unwrap();
+        assert_eq!(
+            runtime
+                .list_prunable_sessions(key.as_str(), "")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // Activity after preview must prevent deletion even when still idle.
+        store
+            .append_event(&key, None, "recent.activity", json!({}))
+            .await
+            .unwrap();
+        assert!(!runtime.prune_session(&key).await.unwrap());
+        assert!(backend.stopped.lock().unwrap().is_empty());
+        assert!(store.get_session(&key).await.is_ok());
+        sqlx::query("update session_events set created_at = now() - interval '744 hours' where thread_key = $1")
+            .bind(key.as_str()).execute(store.pool()).await.unwrap();
+        assert!(runtime.prune_session(&key).await.unwrap());
+        assert_eq!(*backend.stopped.lock().unwrap(), vec!["prune-sbx"]);
+        assert!(store.get_session(&key).await.is_err());
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_lifecycle_preserves_archives_and_rolls_back_failed_cleanup() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let key = ThreadKey::parse(format!(
+            "api:acl_{}:lifecycle",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, _stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend.clone());
+        runtime
+            .create_or_get_session(
+                &key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .unwrap();
+        store
+            .append_messages(
+                &key,
+                &[centaur_session_core::SessionMessageInput {
+                    client_message_id: None,
+                    role: centaur_session_core::MessageRole::User,
+                    parts: vec![json!({"type":"text", "text":"preserve me"})],
+                    metadata: json!({}),
+                }],
+            )
+            .await
+            .unwrap();
+        let execution = execute_with_metadata(&runtime, &key, json!({})).await;
+        assert!(
+            runtime.delete_session(&key).await.is_err(),
+            "never delete a busy session"
+        );
+        assert!(runtime.set_session_archived(&key, true).await.is_err());
+        assert!(backend.stopped.lock().unwrap().is_empty());
+        store
+            .complete_execution(&execution.execution_id)
+            .await
+            .unwrap();
+
+        runtime.set_session_archived(&key, true).await.unwrap();
+        assert!(
+            runtime
+                .list_client_sessions(key.as_str(), "")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let all = runtime
+            .list_client_sessions_with_archived(key.as_str(), "", true)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0]["archived"], true);
+        assert_eq!(
+            store.get_session(&key).await.unwrap().sandbox_id.as_deref(),
+            Some("mock-sbx")
+        );
+        assert!(
+            backend.stopped.lock().unwrap().is_empty(),
+            "archive preserves files"
+        );
+        runtime.set_session_archived(&key, false).await.unwrap();
+        assert_eq!(
+            runtime
+                .list_client_sessions(key.as_str(), "")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        backend.stop_fails.store(true, Ordering::SeqCst);
+        assert!(runtime.delete_session(&key).await.is_err());
+        assert_eq!(
+            store.get_session(&key).await.unwrap().sandbox_id.as_deref(),
+            Some("mock-sbx"),
+            "failed cleanup must keep its sandbox reference"
+        );
+        backend.stop_fails.store(false, Ordering::SeqCst);
+        runtime.delete_session(&key).await.unwrap();
+        assert!(matches!(
+            store.get_session(&key).await,
+            Err(SessionStoreError::NotFound { .. })
+        ));
+        assert_eq!(*backend.stopped.lock().unwrap(), vec!["mock-sbx"]);
+        assert!(
+            runtime
+                .list_client_sessions_with_archived(key.as_str(), "", true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for table in ["session_messages", "session_events", "session_executions"] {
+            let count: i64 = sqlx::query_scalar(&format!(
+                "select count(*) from {table} where thread_key = $1"
+            ))
+            .bind(key.as_str())
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(count, 0, "{table} must be cascaded");
+        }
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn new_execution_renews_attach_without_replacing_or_replaying_sandbox() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:renew-attach-{}", uuid::Uuid::new_v4())).unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        // The old attach stays open and accepts buffered writes, but no longer
+        // delivers them to the harness. EOF-based recovery cannot detect this.
+        let (first_io, mut first_stdout, first_stdin) = mock_io();
+        let (second_io, mut second_stdout, second_stdin) = mock_io();
+        backend.push_io(first_io).await;
+        backend.push_io(second_io).await;
+        let runtime = runtime_with(&store, backend.clone());
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .unwrap();
+        let first = execute_with_metadata(&runtime, &thread_key, json!({})).await;
+        let mut first_stdin = FramedRead::new(first_stdin, LinesCodec::new());
+        assert!(first_stdin.next().await.unwrap().unwrap().contains("hi"));
+        store.complete_execution(&first.execution_id).await.unwrap();
+
+        let second = execute_with_metadata(&runtime, &thread_key, json!({})).await;
+        assert_eq!(backend.opens(), 2, "new turn must not reuse a stale attach");
+        assert_eq!(backend.created_specs().len(), 1, "keep the same sandbox");
+        assert!(backend.stopped.lock().unwrap().is_empty());
+        assert!(
+            timeout(Duration::from_secs(1), first_stdin.next())
+                .await
+                .expect("old input pipe must close promptly")
+                .is_none(),
+            "old input pipe must close"
+        );
+        assert!(first_stdout.write_all(b"stale output\n").await.is_err());
+        let mut second_stdin = FramedRead::new(second_stdin, LinesCodec::new());
+        let line = second_stdin.next().await.unwrap().unwrap();
+        assert!(line.contains(&second.execution_id));
+        assert!(
+            !line.contains(&first.execution_id),
+            "never replay the old turn"
+        );
+        second_stdout
+            .write_all(&completed_output_bytes("Fresh attach completed."))
+            .await
+            .unwrap();
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        assert_eq!(
+            store
+                .get_session(&thread_key)
+                .await
+                .unwrap()
+                .sandbox_id
+                .as_deref(),
+            Some("mock-sbx")
         );
         reset_test_store(&store).await;
     }

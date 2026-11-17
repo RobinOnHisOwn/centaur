@@ -12,8 +12,10 @@ clap = { workspace = true, features = ["derive", "env"] }
 crossterm.workspace = true
 eyre.workspace = true
 futures-util.workspace = true
-ratatui.workspace = true
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
+tui-markdown = { version = "=0.3.13", default-features = false }
 serde_json.workspace = true
+reqwest.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 uuid.workspace = true
 

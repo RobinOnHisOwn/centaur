@@ -230,9 +230,15 @@ pub fn build_router_with_session_and_workflow_runtime(
 
 pub fn build_router_with_app_state(state: AppState) -> Router {
     let protected = Router::new()
+        .route("/api/sessions", get(list_client_sessions))
+        .route("/api/session/{thread_key}/state", get(get_session_state))
+        .route("/api/session/{thread_key}/archive", post(archive_session))
+        .route("/api/session/{thread_key}/prune", delete(prune_session))
         .route(
             "/api/session/{thread_key}",
-            post(create_or_get_session).get(get_session_context),
+            post(create_or_get_session)
+                .get(get_session_context)
+                .delete(delete_session),
         )
         .route(
             "/api/session/{thread_key}/messages",
@@ -554,14 +560,17 @@ pub(crate) fn api_client_may_touch(
     route: &str,
     thread_key: Option<ThreadKey>,
 ) -> bool {
-    route.starts_with("/api/session/")
-        && thread_key.is_some_and(|thread_key| client.owns_thread_key(&thread_key))
+    route == "/api/sessions"
+        || (route.starts_with("/api/session/")
+            && thread_key.is_some_and(|thread_key| client.owns_thread_key(&thread_key)))
 }
 
 fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
     let capability = |capability| Some(RouteAccess::Capability(capability));
     match (method, route) {
-        (&Method::GET, "/api/session/{thread_key}")
+        (&Method::GET, "/api/sessions")
+        | (&Method::GET, "/api/session/{thread_key}/state")
+        | (&Method::GET, "/api/session/{thread_key}")
         | (&Method::GET, "/api/session/{thread_key}/events") => {
             capability(Capability::SessionsRead)
         }
@@ -571,7 +580,10 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
         | (&Method::POST, "/api/session/{thread_key}/interrupt") => {
             capability(Capability::SessionsWrite)
         }
-        (&Method::DELETE, "/api/session/{thread_key}/sandbox") => {
+        (&Method::DELETE, "/api/session/{thread_key}/sandbox")
+        | (&Method::DELETE, "/api/session/{thread_key}")
+        | (&Method::DELETE, "/api/session/{thread_key}/prune")
+        | (&Method::POST, "/api/session/{thread_key}/archive") => {
             Some(RouteAccess::ApiClientOrOperatorSessionWrite)
         }
         (&Method::POST, "/api/sandboxes/drain")
@@ -716,6 +728,100 @@ async fn create_or_get_session(
         unavailable_requested_persona_id: outcome.unavailable_requested_persona_id,
         persona_model,
     }))
+}
+
+#[derive(Default, serde::Deserialize)]
+struct SessionListQuery {
+    #[serde(default)]
+    after_thread_key: String,
+    #[serde(default)]
+    include_archived: bool,
+    #[serde(default)]
+    prunable_only: bool,
+}
+
+async fn list_client_sessions(
+    State(state): State<AppState>,
+    client: Option<Extension<ApiClientContext>>,
+    Query(query): Query<SessionListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(Extension(client)) = client else {
+        return Err(ApiError::Forbidden(
+            "session discovery requires API client authentication".to_owned(),
+        ));
+    };
+    let runtime = state.runtime()?;
+    let items = if query.prunable_only {
+        runtime
+            .list_prunable_sessions(&client.thread_key_prefix(), &query.after_thread_key)
+            .await?
+    } else {
+        runtime
+            .list_client_sessions_with_archived(
+                &client.thread_key_prefix(),
+                &query.after_thread_key,
+                query.include_archived,
+            )
+            .await?
+    };
+    let next = (items.len() == 100)
+        .then(|| items.last().and_then(|item| item["thread_key"].as_str()))
+        .flatten();
+    Ok(Json(json!({"items": items, "next_after_thread_key": next,
+        "prune_older_than_days": query.prunable_only.then_some(30)})))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchiveSessionRequest {
+    archived: bool,
+}
+
+async fn archive_session(
+    State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
+    Path(raw_thread_key): Path<String>,
+    Json(request): Json<ArchiveSessionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let key = ThreadKey::try_from(raw_thread_key)?;
+    let runtime = state.runtime()?;
+    authorize_principal_session_read(&runtime, &caller, &key).await?;
+    runtime.set_session_archived(&key, request.archived).await?;
+    Ok(Json(json!({"archived": request.archived})))
+}
+
+async fn delete_session(
+    State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
+    Path(raw_thread_key): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let key = ThreadKey::try_from(raw_thread_key)?;
+    let runtime = state.runtime()?;
+    authorize_principal_session_read(&runtime, &caller, &key).await?;
+    runtime.delete_session(&key).await?;
+    Ok(Json(json!({"deleted": true})))
+}
+
+async fn prune_session(
+    State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
+    Path(raw_thread_key): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let key = ThreadKey::try_from(raw_thread_key)?;
+    let runtime = state.runtime()?;
+    authorize_principal_session_read(&runtime, &caller, &key).await?;
+    Ok(Json(json!({"deleted": runtime.prune_session(&key).await?})))
+}
+
+async fn get_session_state(
+    State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
+    Path(raw_thread_key): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let key = ThreadKey::try_from(raw_thread_key)?;
+    let runtime = state.runtime()?;
+    authorize_principal_session_read(&runtime, &caller, &key).await?;
+    Ok(Json(runtime.session_state(&key).await?))
 }
 
 async fn get_session_context(

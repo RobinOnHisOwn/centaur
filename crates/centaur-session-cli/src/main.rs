@@ -15,7 +15,62 @@ use tokio::{
 };
 use uuid::Uuid;
 
+mod terminal;
 mod tui;
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    #[test]
+    fn new_chat_defaults_to_codex_but_allows_explicit_pi() {
+        for (command, expected) in [
+            (vec!["centaur", "chat", "new"], HarnessTypeArg::Codex),
+            (
+                vec!["centaur", "chat", "new", "--harness", "pi"],
+                HarnessTypeArg::Pi,
+            ),
+        ] {
+            let args = Args::try_parse_from(command).unwrap();
+            let Some(terminal::Command::Chat {
+                command: terminal::ChatCommand::New { harness, .. },
+            }) = args.command
+            else {
+                panic!("expected chat new");
+            };
+            assert_eq!(harness, expected);
+        }
+    }
+
+    #[test]
+    fn terminal_commands_do_not_require_a_bearer_token_argument() {
+        for command in [
+            vec![
+                "centaur",
+                "chat",
+                "new",
+                "--harness",
+                "pi",
+                "--name",
+                "refactor",
+            ],
+            vec!["centaur", "chat", "attach", "refactor"],
+            vec!["centaur", "chat", "list"],
+            vec!["centaur", "chat", "status", "refactor"],
+            vec!["centaur", "chat", "interrupt", "refactor"],
+            vec![
+                "centaur",
+                "config",
+                "set",
+                "endpoint",
+                "https://api.example.com",
+            ],
+            vec!["centaur", "login"],
+        ] {
+            assert!(Args::try_parse_from(command.clone()).is_ok(), "{command:?}");
+        }
+    }
+}
 
 const DEFAULT_MESSAGE: &str = "Reply with exactly PONG and nothing else.";
 
@@ -24,10 +79,18 @@ pub(crate) type SseFrame = ApiSseEvent;
 #[derive(Debug, Parser)]
 #[command(about = "Create, execute, or attach to a Centaur session")]
 struct Args {
-    #[arg(long, env = "CENTAUR_API_URL", default_value = "http://127.0.0.1:8080")]
-    api_url: ApiBaseUrl,
+    #[command(subcommand)]
+    command: Option<terminal::Command>,
 
-    #[arg(long, env = "CENTAUR_API_TOKEN", hide_env_values = true)]
+    #[arg(long, env = "CENTAUR_API_URL")]
+    api_url: Option<ApiBaseUrl>,
+
+    #[arg(
+        long,
+        env = "CENTAUR_API_TOKEN",
+        hide_env_values = true,
+        default_value = ""
+    )]
     api_token: String,
 
     #[arg(long)]
@@ -76,6 +139,9 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(command) = &args.command {
+        return terminal::run(command, &args).await;
+    }
     let attach_mode = attach_mode(&args);
     validate_mode(&args, attach_mode)?;
     let (thread_key, generated_thread_key) = thread_key_arg(&args, attach_mode)?;
@@ -85,14 +151,17 @@ async fn main() -> Result<()> {
     if args.api_token.trim().is_empty() {
         bail!("CENTAUR_API_TOKEN must not be empty");
     }
-    let client = CentaurClient::with_bearer_token(args.api_url.as_str(), &args.api_token)
-        .wrap_err("configure API authentication")?;
+    let client = CentaurClient::with_bearer_token(
+        args.api_url
+            .as_ref()
+            .map(ApiBaseUrl::as_str)
+            .unwrap_or("http://127.0.0.1:8080"),
+        &args.api_token,
+    )
+    .wrap_err("configure API authentication")?;
 
     if attach_mode {
-        let events = client
-            .stream_events(&thread_key, args.after_event_id)
-            .await
-            .wrap_err("open event stream")?;
+        let events = client.reconnecting_events(&thread_key, args.after_event_id);
         if args.tui {
             return tui::run(client, thread_key, events, tui_options(&args)).await;
         }
@@ -132,10 +201,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    let events = client
-        .stream_events(&thread_key, args.after_event_id)
-        .await
-        .wrap_err("open event stream")?;
+    let events = client.reconnecting_events(&thread_key, args.after_event_id);
 
     if let Some(input_lines) = initial_input_lines {
         execute_input_lines(
@@ -158,6 +224,7 @@ async fn main() -> Result<()> {
 
 fn tui_options(args: &Args) -> tui::TuiOptions {
     tui::TuiOptions {
+        initial_state: None,
         debug_visible: args.debug,
         idle_timeout_ms: args.idle_timeout_ms,
         max_duration_ms: args.max_duration_ms,

@@ -2,8 +2,10 @@
 
 Centaur can run [Pi](https://github.com/earendil-works/pi) as a session
 harness alongside Codex, Claude Code, Amp, Nanocodex, and Hermes. Start a
-Slack thread with `--pi`, or set `pi` as a Slack channel default. Pi is
-available from Slack only for now.
+Slack thread with `--pi`, set `pi` as a Slack channel default, or create a
+session through the public API with `harness_type: "pi"`. The
+terminal client in `crates/centaur-session-cli` drives the same session API;
+it does not run Pi locally.
 
 The sandbox keeps one `pi --mode rpc` process per thread. Pi saves the session
 on disk under an id derived from the thread key, so an interrupt (which stops
@@ -19,7 +21,8 @@ tool item.
 
 ## Credentials
 
-Pi supports API-key auth only. It reads `ANTHROPIC_API_KEY` and
+Centaur's Pi integration supports API-key auth only (Pi itself also supports
+account OAuth; Centaur does not currently broker those Pi credentials). It reads `ANTHROPIC_API_KEY` and
 `OPENAI_API_KEY` from the sandbox environment, where api-rs sets iron-proxy
 placeholders that the proxy replaces with the real keys. The sandbox has the
 Anthropic placeholder only when `CLAUDE_CODE_AUTH_MODE` is `api_key`, and the
