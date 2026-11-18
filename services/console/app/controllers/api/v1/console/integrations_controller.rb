@@ -11,17 +11,25 @@ module Api
       class IntegrationsController < BaseController
         include OauthAppUrls
 
-        allow_active_users only: :index
+        allow_active_users only: %i[index disconnect]
 
         USAGE = { shared: "shared", always_available: "always_available", direct_messages: "direct_messages" }.freeze
 
         def index
+          response.set_header("Cache-Control", "no-store")
           integrations = ConsoleIntegrations.new(user: current_user, acting_admin: acting_admin?)
           render json: { data: {
             apps: integrations.apps.map { |app| app_payload(app, integrations.credential_for(app)) },
             presets: integrations.presets.map { |provider| preset_payload(provider) },
             ssh_key: { configured: integrations.ssh_key_configured? }
           } }
+        end
+
+        def disconnect
+          ConsoleIntegrations.new(user: current_user, acting_admin: false).disconnect_mcp!(params[:slug])
+          head :no_content
+        rescue ActiveRecord::RecordNotDestroyed
+          render status: :conflict, json: { error: { message: "The connection is still referenced; ask an operator to disconnect it." } }
         end
 
         private
@@ -36,6 +44,8 @@ module Api
             always_available: app.always_available,
             usage: usage(app),
             start_url: oauth_start_url(app.slug),
+            mcp_resource: app.mcp_resource,
+            can_disconnect_mcp: app.mcp_resource.present? && app.broker_credentials.where(created_by: current_user).exists?,
             connection: credential && {
               status: app.credential_needs_reconnect?(credential) ? "needs_reconnect" : "connected"
             }

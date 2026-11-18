@@ -491,6 +491,16 @@ impl IronControlClient {
         expect_success(resp, Method::DELETE, &path).await
     }
 
+    /// Read the owner's native Console integrations; never credential values.
+    pub async fn personal_mcp_connections(&self, user_id: i64, principal: &str) -> Result<Value> {
+        let path = format!(
+            "{API_PREFIX}/personal_mcp_connections/{user_id}?principal={}",
+            urlencoding::encode(principal)
+        );
+        let response = self.send(Method::GET, &path, None::<&Value>).await?;
+        decode_data(response, Method::GET, &path).await
+    }
+
     // ----- transport -------------------------------------------------------
 
     /// Wrap ``data`` in the ``{ "data": ... }`` envelope, send, and unwrap the

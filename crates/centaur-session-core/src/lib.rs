@@ -11,6 +11,8 @@ use strum::{AsRefStr, Display, EnumString};
 use thiserror::Error;
 use time::OffsetDateTime;
 
+pub mod mcp;
+
 pub const MAX_THREAD_KEY_BYTES: usize = 512;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]

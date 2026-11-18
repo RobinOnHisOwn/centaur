@@ -22,6 +22,7 @@ use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use uuid::Uuid;
 
+mod mcp;
 mod migrations;
 
 pub use migrations::{TextSearchBackend, migrate, migration_list};
@@ -329,7 +330,7 @@ impl PgSessionStore {
         after: &str,
         include_archived: bool,
     ) -> Result<Vec<Value>, SessionStoreError> {
-        self.list_client_sessions_filtered(prefix, after, include_archived, false)
+        self.list_visible_client_sessions(prefix, after, include_archived, false, None)
             .await
     }
 
@@ -338,16 +339,17 @@ impl PgSessionStore {
         prefix: &str,
         after: &str,
     ) -> Result<Vec<Value>, SessionStoreError> {
-        self.list_client_sessions_filtered(prefix, after, true, true)
+        self.list_visible_client_sessions(prefix, after, true, true, None)
             .await
     }
 
-    async fn list_client_sessions_filtered(
+    pub async fn list_visible_client_sessions(
         &self,
         prefix: &str,
         after: &str,
         include_archived: bool,
         prunable_only: bool,
+        personal_principal: Option<&str>,
     ) -> Result<Vec<Value>, SessionStoreError> {
         Ok(sqlx::query_scalar::<_, Value>(&format!(
             r#"
@@ -362,6 +364,7 @@ impl PgSessionStore {
                 where thread_key = s.thread_key order by created_at desc, execution_id desc limit 1
             ) e on true
             where starts_with(s.thread_key, $1) and s.thread_key > $2
+              and (not (s.metadata ? $6) or s.iron_control_principal = $5)
               and ($3 or coalesce(s.metadata->>'archived', 'false') <> 'true')
               and (not $4 or (
                 {SESSION_ACTIVITY_SQL} < now() - interval '720 hours'
@@ -376,6 +379,8 @@ impl PgSessionStore {
         .bind(after)
         .bind(include_archived)
         .bind(prunable_only)
+        .bind(personal_principal)
+        .bind(centaur_session_core::mcp::MCP_SNAPSHOT_KEY)
         .fetch_all(&self.pool)
         .await?)
     }
@@ -2531,7 +2536,7 @@ mod tests {
 
     use super::{IdleSandboxCandidateRow, PgSessionStore, SessionEventNotification};
 
-    async fn test_store() -> Option<PgSessionStore> {
+    pub(super) async fn test_store() -> Option<PgSessionStore> {
         static MIGRATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         let _migration_guard = MIGRATION_LOCK.lock().await;
         let Ok(url) = std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL") else {

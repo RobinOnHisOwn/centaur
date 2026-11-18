@@ -1,4 +1,5 @@
 mod cleanup;
+mod personal_mcp;
 mod retention;
 mod title_generator;
 
@@ -908,12 +909,39 @@ impl SessionRuntime {
         Ok(self.store.get_session(thread_key).await?)
     }
 
+    pub async fn personal_mcp_snapshot(
+        &self,
+        key: &ThreadKey,
+    ) -> Result<Value, SessionRuntimeError> {
+        Ok(self.store.session_mcp_metadata(key).await?)
+    }
+
     pub async fn list_client_sessions(
         &self,
         prefix: &str,
         after: &str,
     ) -> Result<Vec<Value>, SessionRuntimeError> {
         Ok(self.store.list_client_sessions(prefix, after).await?)
+    }
+
+    pub async fn list_visible_client_sessions(
+        &self,
+        prefix: &str,
+        after: &str,
+        include_archived: bool,
+        prunable_only: bool,
+        personal_principal: Option<&str>,
+    ) -> Result<Vec<Value>, SessionRuntimeError> {
+        Ok(self
+            .store
+            .list_visible_client_sessions(
+                prefix,
+                after,
+                include_archived,
+                prunable_only,
+                personal_principal,
+            )
+            .await?)
     }
 
     pub async fn list_client_sessions_with_archived(
@@ -1903,6 +1931,16 @@ impl SessionRuntime {
                     harness_type = %harness_type,
                     "persona-pinned harness replaced the requested harness"
                 );
+            }
+            if existing_harness.is_none()
+                && session_metadata
+                    .get(centaur_session_core::mcp::MCP_SNAPSHOT_KEY)
+                    .is_some()
+                && harness_type != &HarnessType::Codex
+            {
+                return Err(SessionRuntimeError::BadRequest(
+                    "personal MCP currently requires the Codex harness".into(),
+                ));
             }
             match self
                 .store
@@ -3481,12 +3519,16 @@ impl SessionRuntime {
                 }
             }
 
+            let mcp_metadata = self.store.session_mcp_metadata(thread_key).await?;
+            // Personal MCP settings must be installed before the harness starts;
+            // a generic pre-booted sandbox cannot supply this session's snapshot.
+            let has_personal_mcp = mcp_metadata.get(centaur_session_core::mcp::MCP_SNAPSHOT_KEY).is_some();
             // Warm sandboxes are pre-booted per harness, repo-cache access,
             // and persona; any other session needs a cold sandbox.
             let warm_pool = self
                 .warm_pools
                 .as_ref()
-                .filter(|pools| boot_mode.uses_warm_pool() && !pools.keys.is_empty())
+                .filter(|pools| boot_mode.uses_warm_pool() && !pools.keys.is_empty() && !has_personal_mcp)
                 .and_then(|pools| {
                     let persona = persona_context
                         .as_ref()
@@ -3602,6 +3644,7 @@ impl SessionRuntime {
             }
             apply_sandbox_boot_mode(&mut spec, &boot_mode);
             apply_sandbox_capabilities(&mut spec, desired_capabilities);
+            personal_mcp::apply(&mut spec, &mcp_metadata, iron_control_principal, harness_type)?;
             let create_started = Instant::now();
             let handle = self
                 .run_with_running_capacity(thread_key, execution_id, "cold_create", || async {
@@ -12789,6 +12832,65 @@ mod adoption_tests {
             Some("mock-sbx")
         );
         reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn personal_mcp_snapshot_reaches_cold_and_recreated_sandbox_specs() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let key = ThreadKey::parse(format!("test:personal-mcp-{}", uuid::Uuid::new_v4())).unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend.clone());
+        runtime.create_or_get_session(&key,&HarnessType::Codex,None,
+            Some(json!({"personal_mcp_servers":{"principal":"prn_test","servers":[{"name":"oap_docs","url":"https://mcp.example.com/mcp"}]}})),
+            HarnessConflictPolicy::Reject).await.unwrap();
+        for index in 0..2 {
+            let (io, mut stdout, stdin) = mock_io();
+            backend.push_io(io).await;
+            let execution = execute_with_metadata(&runtime, &key, json!({})).await;
+            let mut input = FramedRead::new(stdin, LinesCodec::new());
+            assert!(input.next().await.unwrap().unwrap().contains("hi"));
+            let specs = backend.created_specs();
+            assert_eq!(specs.len(), index + 1);
+            let overlay = specs
+                .last()
+                .unwrap()
+                .env
+                .iter()
+                .find(|entry| entry.name == "CODEX_CONFIG_OVERLAY")
+                .unwrap();
+            let settings: toml::Value = toml::from_str(&overlay.value).unwrap();
+            assert_eq!(
+                settings["mcp_servers"]["user_oap_docs"]["url"].as_str(),
+                Some("https://mcp.example.com/mcp")
+            );
+            assert!(!overlay.value.contains("access_token"));
+            stdout
+                .write_all(&completed_output_bytes("MCP fixture completed."))
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let latest = store
+                        .latest_execution_for_thread(&key)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if latest.execution_id == execution.execution_id
+                        && latest.status == centaur_session_core::ExecutionStatus::Completed
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            runtime.release_session_sandbox(&key).await.unwrap();
+        }
+        runtime.delete_session(&key).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

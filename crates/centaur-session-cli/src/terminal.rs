@@ -36,6 +36,25 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: ChatCommand,
     },
+    /// Connect existing Console MCP integrations for new Codex sessions.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum McpCommand {
+    Add {
+        name: String,
+        #[arg(long)]
+        url: String,
+    },
+    List,
+    /// Print the personal browser-consent link; provider tokens stay in Console.
+    Login {
+        name: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -345,6 +364,85 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
                 "Authenticated; credential saved in {} (mode 0600)",
                 config_path()?.display()
             );
+        }
+        Command::Mcp { command } => {
+            use centaur_session_core::mcp::{McpServer, valid_mcp_name};
+            // Validate before authenticating; the server also requires this URL
+            // to match an existing operator-approved Console integration.
+            let server = if let McpCommand::Add { name, url } = command {
+                let server = McpServer {
+                    name: name.clone(),
+                    url: url.clone(),
+                };
+                server.validate().map_err(|error| eyre!(error))?;
+                Some(server)
+            } else {
+                None
+            };
+            if let McpCommand::Login { name } = command
+                && !valid_mcp_name(name)
+            {
+                bail!("invalid MCP name")
+            }
+            let (client, _) = client(&config, args)?;
+            match command {
+                McpCommand::Add { .. } => {
+                    let result = client
+                        .connect_mcp_integration(
+                            server
+                                .as_ref()
+                                .ok_or_else(|| eyre!("missing MCP settings"))?,
+                        )
+                        .await?;
+                    let url = result["authorization_url"]
+                        .as_str()
+                        .ok_or_else(|| eyre!("backend returned no consent URL"))?;
+                    endpoint(url)?;
+                    println!(
+                        "Existing Console integration found. Complete personal consent:\n{url}\nNo separate MCP configuration record was created."
+                    );
+                }
+                McpCommand::List => {
+                    let value = client.list_mcp_servers().await?;
+                    let items = value["items"]
+                        .as_array()
+                        .ok_or_else(|| eyre!("invalid integration listing"))?;
+                    println!("NAME\tURL\tACCOUNT STATUS\tAVAILABLE TO PRINCIPAL");
+                    for item in items {
+                        let server = McpServer {
+                            name: item["name"]
+                                .as_str()
+                                .ok_or_else(|| eyre!("missing integration name"))?
+                                .into(),
+                            url: item["url"]
+                                .as_str()
+                                .ok_or_else(|| eyre!("missing integration URL"))?
+                                .into(),
+                        };
+                        server.validate().map_err(|error| eyre!(error))?;
+                        let status = item["status"]
+                            .as_str()
+                            .filter(|status| {
+                                matches!(*status, "connected" | "not_connected" | "needs_reconnect")
+                            })
+                            .ok_or_else(|| eyre!("invalid account status"))?;
+                        let available = item["available"]
+                            .as_bool()
+                            .ok_or_else(|| eyre!("missing grant status"))?;
+                        println!("{}\t{}\t{}\t{}", server.name, server.url, status, available);
+                    }
+                }
+                McpCommand::Login { name } => {
+                    let result = client.login_mcp_server(name).await?;
+                    let url = result["authorization_url"]
+                        .as_str()
+                        .ok_or_else(|| eyre!("backend returned no consent URL"))?;
+                    endpoint(url)?;
+                    println!(
+                        "Open this URL and sign in with your personal Console account:\n{url}\nConsent and token refresh are server-side. This command does not confirm that consent completed."
+                    );
+                }
+            }
         }
         Command::Chat { command } => {
             let (client, id) = client(&config, args)?;

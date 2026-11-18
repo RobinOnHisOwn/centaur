@@ -6,6 +6,7 @@ pub mod client;
 mod client_tests;
 mod error;
 mod mcp;
+mod personal_mcp;
 mod routes;
 mod slack_external_teams;
 mod slack_proxy;
@@ -32,6 +33,8 @@ pub fn warm_slack_public_channel_cache() {
 
 #[cfg(test)]
 mod tests {
+    mod personal_mcp;
+
     use std::sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -164,6 +167,18 @@ mod tests {
             labels: Default::default(),
             sandbox_observability_enabled: true,
         }
+    }
+
+    // Metadata-only tests must not depend on DNS or localhost PostgreSQL.
+    fn context_test_router() -> axum::Router {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(25))
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/centaur_test")
+            .unwrap();
+        build_router_with_runtime(
+            PgSessionStore::new(pool),
+            SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
+        )
     }
 
     fn build_router_with_runtime(
@@ -1152,12 +1167,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_context_exposes_slack_channel_and_thread_ts() {
-        let pool =
-            PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test").unwrap();
-        let app = build_router_with_runtime(
-            PgSessionStore::new(pool),
-            SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
-        );
+        let app = context_test_router();
 
         let response = app
             .oneshot(
@@ -1183,12 +1193,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_context_exposes_discord_guild_channel_and_thread() {
-        let pool =
-            PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test").unwrap();
-        let app = build_router_with_runtime(
-            PgSessionStore::new(pool),
-            SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
-        );
+        let app = context_test_router();
 
         let response = app
             .oneshot(
@@ -1215,12 +1220,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_context_exposes_linear_issue_comment_and_session() {
-        let pool =
-            PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test").unwrap();
-        let app = build_router_with_runtime(
-            PgSessionStore::new(pool),
-            SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
-        );
+        let app = context_test_router();
 
         let response = app
             .oneshot(
@@ -1247,12 +1247,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_context_exposes_github_repo_number_and_review_comment() {
-        let pool =
-            PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test").unwrap();
-        let app = build_router_with_runtime(
-            PgSessionStore::new(pool),
-            SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
-        );
+        let app = context_test_router();
 
         let response = app
             .oneshot(
@@ -1282,12 +1277,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_context_omits_slack_for_non_slack_thread_key() {
-        let pool =
-            PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test").unwrap();
-        let app = build_router_with_runtime(
-            PgSessionStore::new(pool),
-            SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
-        );
+        let app = context_test_router();
 
         let response = app
             .oneshot(

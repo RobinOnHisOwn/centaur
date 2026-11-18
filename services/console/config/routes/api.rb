@@ -6,6 +6,8 @@
 
 namespace :api do
   namespace :v1 do
+    get "personal_mcp_connections/:user_id", to: "personal_mcp_connections#index"
+
     # Each secret type is addressable by opaque oid or globally unique foreign_id.
     # The /lookup/default/... form is a temporary compatibility alias.
     resources :static_secrets, only: %i[index show create update destroy] do

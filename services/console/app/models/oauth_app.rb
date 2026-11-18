@@ -53,6 +53,21 @@ class OauthApp < ApplicationRecord
     Oauth::Providers.fetch(provider)
   end
 
+  # Reuse the operator's existing app registry. Explicit opt-in prevents an
+  # ordinary OAuth/API integration from silently becoming a harness MCP server.
+  def mcp_resource
+    return unless labels.is_a?(Hash) && labels["mcp"] == "true" && !shared?
+
+    strategy = provider_strategy
+    return unless strategy.respond_to?(:mcp_resource)
+
+    resource = strategy.mcp_resource
+    uri = URI.parse(resource.to_s)
+    resource if uri.is_a?(URI::HTTPS) && uri.host.present? && !uri.userinfo && !uri.query && !uri.fragment
+  rescue URI::InvalidURIError
+    nil
+  end
+
   # True when every requested scope is within the allowlist.
   def scopes_allowed?(requested) = (Array(requested) - Array(allowed_scopes)).empty?
 

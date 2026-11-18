@@ -69,6 +69,17 @@ impl ApiClientContext {
         &self.client_id
     }
 
+    pub(crate) async fn personal_mcp_identity(
+        &self,
+        pool: &PgPool,
+    ) -> Result<Option<centaur_console_db::PersonalMcpIdentity>, ApiError> {
+        centaur_console_db::personal_mcp_identity(pool, self.id)
+            .await
+            .map_err(|error| {
+                ApiError::Internal(format!("failed to read personal MCP identity: {error}"))
+            })
+    }
+
     pub(crate) async fn principals(
         &self,
         pool: &PgPool,
@@ -118,9 +129,13 @@ pub(crate) async fn refresh_api_client(
 
 /// Resolves once the API client behind `caller` may no longer read session
 /// events: its token expired, or the client was disabled, deleted, or lost
-/// `sessions:read`, or its secret was rotated. A failed lookup leaves access
-/// as it was until the next check.
-pub(crate) async fn api_client_read_access_ended(pool: PgPool, caller: AuthenticatedCaller) {
+/// `sessions:read`, or its secret was rotated. Personal MCP streams additionally
+/// recheck the active user's binding; failure to verify that boundary ends them.
+pub(crate) async fn api_client_read_access_ended(
+    pool: PgPool,
+    caller: AuthenticatedCaller,
+    personal_principal: Option<String>,
+) {
     let Some(expires_at) = caller.api_client_token().map(|token| token.expires_at) else {
         return;
     };
@@ -129,15 +144,27 @@ pub(crate) async fn api_client_read_access_ended(pool: PgPool, caller: Authentic
         let Ok(remaining @ 1..) = u64::try_from(remaining) else {
             return;
         };
-        tokio::time::sleep(EVENT_STREAM_RECHECK_INTERVAL.min(Duration::from_secs(remaining))).await;
         let mut refreshed = caller.clone();
         match refresh_api_client(&pool, &mut refreshed).await {
-            Ok(_) if refreshed.has_capability(Capability::SessionsRead) => {}
+            Ok(client) if refreshed.has_capability(Capability::SessionsRead) => {
+                if let Some(expected) = personal_principal.as_deref() {
+                    match client.personal_mcp_identity(&pool).await {
+                        Ok(Some(owner))
+                            if owner.active
+                                && oid(PRINCIPAL_OID_PREFIX, owner.principal_id) == expected => {}
+                        _ => return,
+                    }
+                }
+            }
             Ok(_) | Err(ApiError::Unauthorized(_)) => return,
             Err(error) => {
                 tracing::warn!(error = %error, "failed to re-check API client on an event stream");
+                if personal_principal.is_some() {
+                    return;
+                }
             }
         }
+        tokio::time::sleep(EVENT_STREAM_RECHECK_INTERVAL.min(Duration::from_secs(remaining))).await;
     }
 }
 

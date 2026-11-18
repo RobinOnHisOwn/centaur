@@ -72,6 +72,7 @@ pub struct AppState {
     auth: ApiAuthConfig,
     /// Console's database, read for API client authentication.
     console_db: Option<PgPool>,
+    console_control: Option<centaur_iron_control::IronControlClient>,
 }
 
 #[derive(Clone)]
@@ -88,6 +89,7 @@ impl AppState {
             metrics: prometheus_handle().expect("failed to initialize Prometheus metrics recorder"),
             auth,
             console_db: None,
+            console_control: None,
         }
     }
 
@@ -95,6 +97,22 @@ impl AppState {
     pub fn with_console_db(mut self, pool: PgPool) -> Self {
         self.console_db = Some(pool);
         self
+    }
+
+    pub fn with_console_control(
+        mut self,
+        client: Option<centaur_iron_control::IronControlClient>,
+    ) -> Self {
+        self.console_control = client;
+        self
+    }
+
+    pub(crate) fn console_control(
+        &self,
+    ) -> Result<&centaur_iron_control::IronControlClient, ApiError> {
+        self.console_control.as_ref().ok_or_else(|| {
+            ApiError::ServiceUnavailable("Console control plane is not configured".into())
+        })
     }
 
     pub(crate) fn auth(&self) -> &ApiAuthConfig {
@@ -231,6 +249,14 @@ pub fn build_router_with_session_and_workflow_runtime(
 pub fn build_router_with_app_state(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/sessions", get(list_client_sessions))
+        .route(
+            "/api/mcp/servers",
+            get(crate::personal_mcp::list).post(crate::personal_mcp::connect),
+        )
+        .route(
+            "/api/mcp/servers/{name}/login",
+            post(crate::personal_mcp::login),
+        )
         .route("/api/session/{thread_key}/state", get(get_session_state))
         .route("/api/session/{thread_key}/archive", post(archive_session))
         .route("/api/session/{thread_key}/prune", delete(prune_session))
@@ -431,6 +457,7 @@ async fn metrics(State(state): State<AppState>) -> Response {
 #[derive(Clone, Copy)]
 enum RouteAccess {
     Capability(Capability),
+    ConsoleServiceOnly,
     PrincipalOnly,
     /// Session write access, held by an API client (confined to its own
     /// namespace) or an operator; ingress keys are excluded.
@@ -485,6 +512,7 @@ async fn authorize_api_request(
 
     let allowed = match access {
         RouteAccess::Capability(capability) => caller.has_capability(capability),
+        RouteAccess::ConsoleServiceOnly => caller.class() == CallerClass::Console,
         RouteAccess::PrincipalOnly => caller.class() == CallerClass::Principal,
         RouteAccess::ApiClientOrOperatorSessionWrite => {
             caller.has_capability(Capability::SessionsWrite)
@@ -545,6 +573,23 @@ async fn authorize_api_request(
             .into_response();
     }
 
+    if let (Some(client), Some(runtime), Some(key)) = (
+        &api_client,
+        state.session_runtime(),
+        session_thread_key_from_request(&request),
+    ) {
+        match runtime.session(&key).await {
+            Ok(session) => {
+                if let Err(error) =
+                    crate::personal_mcp::authorize_saved_session(&state, client, &session).await
+                {
+                    return error.into_response();
+                }
+            }
+            Err(SessionRuntimeError::Store(SessionStoreError::NotFound { .. })) => {}
+            Err(error) => return ApiError::from(error).into_response(),
+        }
+    }
     record_api_authentication(caller.class().as_str(), "authorized");
     request.extensions_mut().insert(caller);
     if let Some(client) = api_client {
@@ -560,21 +605,26 @@ pub(crate) fn api_client_may_touch(
     route: &str,
     thread_key: Option<ThreadKey>,
 ) -> bool {
-    route == "/api/sessions"
-        || (route.starts_with("/api/session/")
-            && thread_key.is_some_and(|thread_key| client.owns_thread_key(&thread_key)))
+    matches!(
+        route,
+        "/api/sessions" | "/api/mcp/servers" | "/api/mcp/servers/{name}/login"
+    ) || (route.starts_with("/api/session/")
+        && thread_key.is_some_and(|thread_key| client.owns_thread_key(&thread_key)))
 }
 
 fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
     let capability = |capability| Some(RouteAccess::Capability(capability));
     match (method, route) {
         (&Method::GET, "/api/sessions")
+        | (&Method::GET, "/api/mcp/servers")
         | (&Method::GET, "/api/session/{thread_key}/state")
         | (&Method::GET, "/api/session/{thread_key}")
         | (&Method::GET, "/api/session/{thread_key}/events") => {
             capability(Capability::SessionsRead)
         }
-        (&Method::POST, "/api/session/{thread_key}")
+        (&Method::POST, "/api/mcp/servers")
+        | (&Method::POST, "/api/mcp/servers/{name}/login")
+        | (&Method::POST, "/api/session/{thread_key}")
         | (&Method::POST, "/api/session/{thread_key}/messages")
         | (&Method::POST, "/api/session/{thread_key}/execute")
         | (&Method::POST, "/api/session/{thread_key}/interrupt") => {
@@ -677,6 +727,16 @@ async fn create_or_get_session(
     Json(request): Json<CreateSessionRequest>,
 ) -> Result<Json<CreateSessionResponse>, ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    if request
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get(centaur_session_core::mcp::MCP_SNAPSHOT_KEY))
+        .is_some()
+    {
+        return Err(ApiError::BadRequest(
+            "personal MCP session metadata is server-owned".into(),
+        ));
+    }
     let harness_type = request.harness_type;
     let runtime = state.runtime()?;
     let on_harness_conflict = match request.on_harness_conflict {
@@ -693,12 +753,16 @@ async fn create_or_get_session(
             let attached = client.principals(&state.console_db()?).await?;
             let principal =
                 select_principal(&attached, request.principal.as_deref(), bound.as_deref())?;
+            let mut metadata = api_client_metadata(client.client_id(), request.metadata);
+            if bound.is_none() {
+                crate::personal_mcp::snapshot(&state, &client, &principal, &mut metadata).await?;
+            }
             runtime
                 .create_or_get_session_with_principal(
                     &thread_key,
                     &harness_type,
                     request.persona_id.as_deref(),
-                    Some(api_client_metadata(client.client_id(), request.metadata)),
+                    Some(metadata),
                     on_harness_conflict,
                     Some(&principal),
                 )
@@ -751,19 +815,20 @@ async fn list_client_sessions(
         ));
     };
     let runtime = state.runtime()?;
-    let items = if query.prunable_only {
-        runtime
-            .list_prunable_sessions(&client.thread_key_prefix(), &query.after_thread_key)
-            .await?
-    } else {
-        runtime
-            .list_client_sessions_with_archived(
-                &client.thread_key_prefix(),
-                &query.after_thread_key,
-                query.include_archived,
-            )
-            .await?
-    };
+    let principal = client
+        .personal_mcp_identity(&state.console_db()?)
+        .await?
+        .filter(|owner| owner.active)
+        .map(|owner| centaur_console_db::oid("prn", owner.principal_id));
+    let items = runtime
+        .list_visible_client_sessions(
+            &client.thread_key_prefix(),
+            &query.after_thread_key,
+            query.include_archived || query.prunable_only,
+            query.prunable_only,
+            principal.as_deref(),
+        )
+        .await?;
     let next = (items.len() == 100)
         .then(|| items.last().and_then(|item| item["thread_key"].as_str()))
         .flatten();
@@ -1108,6 +1173,22 @@ async fn stream_events(
             query.execution_id.as_deref(),
         )
         .await?;
+    let personal_mcp_principal = if caller.class() == CallerClass::ApiClient {
+        let metadata = runtime.personal_mcp_snapshot(&thread_key).await?;
+        match metadata.get(centaur_session_core::mcp::MCP_SNAPSHOT_KEY) {
+            Some(snapshot) => Some(
+                snapshot["principal"]
+                    .as_str()
+                    .ok_or_else(|| {
+                        ApiError::Internal("invalid personal MCP identity snapshot".into())
+                    })?
+                    .to_owned(),
+            ),
+            None => None,
+        }
+    } else {
+        None
+    };
     let stream = events.map(move |result| {
         // Stream failures are server-side faults: log the details, send the
         // client an opaque stream-error event.
@@ -1130,7 +1211,11 @@ async fn stream_events(
     // An API client's access is checked per request; an open stream re-checks
     // it so revocation and token expiry also end long-lived streams.
     let stream = if caller.class() == CallerClass::ApiClient {
-        let ended = api_client_read_access_ended(state.console_db()?, caller.clone());
+        let ended = api_client_read_access_ended(
+            state.console_db()?,
+            caller.clone(),
+            personal_mcp_principal,
+        );
         end_events_when(stream, ended).boxed()
     } else {
         stream.boxed()

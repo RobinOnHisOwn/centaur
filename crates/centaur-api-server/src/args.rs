@@ -98,6 +98,11 @@ impl Args {
         self.sandbox.iron_control_runtime().await
     }
 
+    /// Reuse the configured Console admin client; never forward its key to a sandbox.
+    pub(crate) fn console_control_client(&self) -> Option<IronControlClient> {
+        self.sandbox.iron_control.client()
+    }
+
     /// Console's database pool, when configured. Call within a Tokio runtime.
     pub(crate) fn console_db(&self) -> Option<PgPool> {
         self.sandbox.iron_control.console_db().ok()

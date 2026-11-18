@@ -1,5 +1,6 @@
 import { keepPreviousData, useQuery, useSuspenseQuery, type QueryClient } from "@tanstack/react-query";
 
+import { useSession } from "@/app/session";
 import { api, type DataEnvelope, type ListEnvelope } from "@/lib/api";
 import { createQueryKeys } from "@/lib/query-keys";
 
@@ -62,6 +63,8 @@ export interface IntegrationApp {
   usage: IntegrationUsage;
   start_url: string;
   connection: { status: "connected" | "needs_reconnect" } | null;
+  mcp_resource?: string | null;
+  can_disconnect_mcp?: boolean;
 }
 
 export interface IntegrationPreset {
@@ -153,11 +156,23 @@ export async function updateOauthApp(queryClient: QueryClient, id: string, data:
 export const integrationKeys = createQueryKeys("integrations");
 
 export function useIntegrations() {
+  const { user } = useSession();
   return useQuery({
-    queryKey: integrationKeys.all,
+    queryKey: [...integrationKeys.all, user.id],
     queryFn: ({ signal }) => api.get<DataEnvelope<Integrations>>("/api/v1/console/integrations", undefined, signal),
     select: (body) => body.data,
   });
+}
+
+export async function disconnectMcpIntegration(queryClient: QueryClient, slug: string) {
+  try {
+    await api.delete(`/api/v1/console/integrations/${encodeURIComponent(slug)}/connection`);
+  } finally {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: integrationKeys.all }),
+      queryClient.invalidateQueries({ queryKey: oauthAppKeys.all }),
+    ]);
+  }
 }
 
 /** POST /api/v1/console/oauth_apps/presets/:provider -> the consent start URL. */

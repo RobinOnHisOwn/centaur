@@ -57,6 +57,7 @@ module Oauth
       def identity_scopes = []
       def authorization_scope_param = "scope"
       def scope_separator = " "
+      def mcp_resource = @config["resource"]
       def extra_authorization_params = { "resource" => @config["resource"] }
       def extra_token_params = { "resource" => @config["resource"] }
       def refreshable? = true

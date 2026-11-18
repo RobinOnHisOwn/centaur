@@ -56,6 +56,16 @@ Access tokens stay in memory. The client reacquires expiring tokens using the sa
 
 Optional `centaur config set principal <attached-principal>` selects another attached principal for new sessions. It does not alter an existing session's principal.
 
+## Personal MCP connections (requires matching Console and API versions)
+
+The source of truth is **Console → Integrations**, not a local or session-database registry. An operator must enable a non-shared custom OAuth app (or Granola) with the label `mcp=true` (string value). Use a credential-free HTTPS resource URL and configure Console's public HTTPS origin. Expose the scoped `/api/mcp/servers` routes to CLI users, not the Console operator API.
+
+- `centaur mcp list` shows registered apps, account status and whether the personal principal has a grant. These are not connectivity checks.
+- `centaur mcp login docs` prints Console's consent link. Alternatively, `centaur mcp add docs --url https://mcp.example.com/mcp` checks an existing registration and prints the link; it does not register a new endpoint. Complete consent in a browser with your own Console account.
+- New Codex sessions snapshot eligible endpoints; existing sessions retain their endpoint list. An API client needs a matching personal default principal. No new token store, implicit grant, local provider login, or database migration is needed.
+- Disconnect only through the signed-in Console. This removes **all** of your saved accounts for that integration and their wrapper grants, not just a CLI setting. It does not revoke tokens at the provider. There is no preference-only disable command.
+- The provider or MCP server enforces allowed operations. A proxy grant does not imply read-only access. Verify the actual Codex/proxy path, overlapping credential rules, refresh ownership and revocation before rollout.
+
 ## Daily workflow
 
 New chats default to Codex; no harness flag is needed. Use `--harness pi` only

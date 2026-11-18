@@ -459,3 +459,51 @@ async fn reads_api_clients_and_their_principals() {
         ]
     );
 }
+
+#[tokio::test]
+async fn personal_mcp_identity_uses_native_console_ownership() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let principal = fixture.principal("personal-mcp").await;
+    sqlx::query("UPDATE principals SET kind='console_user', console_user_id=$1 WHERE id=$2")
+        .bind(fixture.admin)
+        .bind(principal)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    let client: i64 = sqlx::query_scalar("INSERT INTO api_clients (name,secret_digest,scopes,created_by_id,created_at,updated_at) VALUES ($1,$2,'[\"sessions:read\",\"sessions:write\"]',$3,now(),now()) RETURNING id")
+        .bind(fixture.name("mcp-client")).bind(fixture.name("digest")).bind(fixture.admin).fetch_one(&fixture.pool).await.unwrap();
+    sqlx::query("INSERT INTO api_client_principals (api_client_id,principal_id,\"default\",created_at,updated_at) VALUES ($1,$2,true,now(),now())")
+        .bind(client).bind(principal).execute(&fixture.pool).await.unwrap();
+    let owner = centaur_console_db::personal_mcp_identity(&fixture.pool, client)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner.user_id, fixture.admin);
+    assert_eq!(owner.principal_id, principal);
+    assert!(owner.active);
+    sqlx::query("UPDATE users SET status='disabled' WHERE id=$1")
+        .bind(fixture.admin)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    assert!(
+        !centaur_console_db::personal_mcp_identity(&fixture.pool, client)
+            .await
+            .unwrap()
+            .unwrap()
+            .active
+    );
+    sqlx::query("UPDATE principals SET kind='service',console_user_id=NULL WHERE id=$1")
+        .bind(principal)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    assert!(
+        centaur_console_db::personal_mcp_identity(&fixture.pool, client)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

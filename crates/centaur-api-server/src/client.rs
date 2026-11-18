@@ -208,6 +208,38 @@ impl CentaurClient {
         .await
     }
 
+    pub async fn list_mcp_servers(&self) -> Result<Value, ClientError> {
+        Ok(self
+            .send(
+                self.client
+                    .get(format!("{}/api/mcp/servers", self.base_url))
+                    .timeout(Duration::from_secs(30)),
+            )
+            .await?
+            .json()
+            .await?)
+    }
+
+    pub async fn connect_mcp_integration(
+        &self,
+        server: &centaur_session_core::mcp::McpServer,
+    ) -> Result<Value, ClientError> {
+        self.post_json(&format!("{}/api/mcp/servers", self.base_url), server)
+            .await
+    }
+
+    pub async fn login_mcp_server(&self, name: &str) -> Result<Value, ClientError> {
+        self.post_json(
+            &format!(
+                "{}/api/mcp/servers/{}/login",
+                self.base_url,
+                urlencoding::encode(name)
+            ),
+            &json!({}),
+        )
+        .await
+    }
+
     pub async fn archive_session(
         &self,
         key: &ThreadKey,

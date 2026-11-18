@@ -21,6 +21,7 @@ class TokenServer(http.server.BaseHTTPRequestHandler):
     prune_policy = True
     prune_error = 0
     prune_page_error = False
+    mcp_items = []
 
     def lifecycle_response(self, value):
         assert self.headers['Authorization'] == 'Bearer fixture-access-token'
@@ -31,6 +32,10 @@ class TokenServer(http.server.BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = urllib.parse.unquote(self.path)
+        if path == '/api/mcp/servers/docs':
+            type(self).mcp_items[0].update(status='not_connected', available=False)
+            self.lifecycle_response({'disconnected': True, 'provider_token_revoked': False})
+            return
         if path.endswith('/prune'):
             assert path in ['/api/session/api:acl_test:old/prune', '/api/session/api:acl_test:old2/prune']
             type(self).lifecycle.append(('DELETE', path))
@@ -46,6 +51,9 @@ class TokenServer(http.server.BaseHTTPRequestHandler):
         self.lifecycle_response({'deleted': True})
 
     def do_GET(self):
+        if self.path == '/api/mcp/servers':
+            self.lifecycle_response({'items': type(self).mcp_items})
+            return
         type(self).lifecycle.append(('GET', self.path))
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
         if query.get('prunable_only') == ['true']:
@@ -65,6 +73,15 @@ class TokenServer(http.server.BaseHTTPRequestHandler):
         self.lifecycle_response({'items': [], 'next_after_thread_key': None})
 
     def do_POST(self):
+        if self.path.startswith('/api/mcp/servers'):
+            body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            if self.path == '/api/mcp/servers':
+                assert body == {'name': 'docs', 'url': 'https://mcp.example.com/mcp'}
+                self.lifecycle_response({'ok': True, 'authorization_url': 'https://console.example.com/oauth/docs/start'})
+            else:
+                assert self.path == '/api/mcp/servers/docs/login'
+                self.lifecycle_response({'authorization_url': 'https://console.example.com/oauth/docs/start'})
+            return
         if self.path.endswith('/archive'):
             path = urllib.parse.unquote(self.path)
             assert path == '/api/session/api:acl_test:old/archive'
@@ -105,6 +122,7 @@ class Configuration(unittest.TestCase):
         TokenServer.prune_policy = True
         TokenServer.prune_error = 0
         TokenServer.prune_page_error = False
+        TokenServer.mcp_items = []
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), TokenServer)
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
@@ -123,6 +141,27 @@ class Configuration(unittest.TestCase):
         self.assertNotIn("fixture-secret", result.stdout + result.stderr)
         self.assertNotIn("fixture-access-token", result.stdout + result.stderr)
         return result
+
+    def test_personal_mcp_reuses_native_connections_without_local_configuration(self):
+        self.run_cli('login', '--secret-stdin', input='fixture-secret\n')
+        before = self.config.read_bytes()
+        native = {'id': 'oap_docs', 'name': 'docs', 'url': 'https://mcp.example.com/mcp',
+                  'status': 'connected', 'available': True}
+        TokenServer.mcp_items = [native.copy()]
+        self.assertIn('docs', self.run_cli('mcp', 'list').stdout)
+        result = self.run_cli('mcp', 'add', 'docs', '--url', native['url'])
+        self.assertIn('No separate MCP configuration record', result.stdout)
+        self.assertEqual(TokenServer.mcp_items, [native], 'add must not create another registry entry')
+        self.assertIn('docs', self.run_cli('mcp', 'list').stdout)
+        self.assertIn('https://console.example.com/oauth/docs/start', self.run_cli('mcp', 'login', 'docs').stdout)
+        count = TokenServer.requests
+        self.run_cli('mcp', 'remove', 'docs', '--yes', ok=False)
+        self.assertEqual(count, TokenServer.requests)
+        self.assertEqual(TokenServer.mcp_items, [native])
+        self.assertEqual(before, self.config.read_bytes(), 'MCP settings/tokens must not be stored locally')
+        count = TokenServer.requests
+        self.run_cli('mcp', 'add', 'bad', '--url', 'https://user:password@example.com/mcp', ok=False)
+        self.assertEqual(count, TokenServer.requests, 'reject unsafe MCP URLs before authenticating')
 
     def test_login_is_verified_private_and_bound_to_endpoint(self):
         self.run_cli("login", "--secret-stdin", input="fixture-secret\n")

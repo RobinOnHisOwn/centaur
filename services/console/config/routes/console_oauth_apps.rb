@@ -14,7 +14,9 @@ namespace :api do
         end
       end
       resources :oauth_providers, only: %i[index]
-      resources :integrations, only: %i[index]
+      resources :integrations, only: %i[index] do
+        delete ":slug/connection", on: :collection, action: :disconnect, constraints: { slug: /[^\/]+/ }
+      end
     end
   end
 end

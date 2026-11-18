@@ -40,7 +40,8 @@ async fn main() -> Result<(), ServerError> {
         "starting centaur api-rs server"
     );
 
-    let mut app_state = AppState::unready(api_auth);
+    let mut app_state =
+        AppState::unready(api_auth).with_console_control(args.console_control_client());
     if let Some(pool) = args.console_db() {
         app_state = app_state.with_console_db(pool);
     }

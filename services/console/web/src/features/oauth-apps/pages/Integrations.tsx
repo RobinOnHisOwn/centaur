@@ -5,13 +5,14 @@ import { toast } from "sonner";
 
 import { ErrorAlert } from "@/components/alerts";
 import { AppLink } from "@/components/app-link";
+import { ConfirmDialog } from "@/components/confirm-dialog";
 import { PageHeader } from "@/components/page-header";
 import { RequireAccess } from "@/components/require-access";
 import { Button } from "@/components/ui/button";
 import { errorMessage, navigation } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-import { setupPreset, useIntegrations, type IntegrationApp, type IntegrationPreset, type IntegrationUsage } from "../api";
+import { disconnectMcpIntegration, setupPreset, useIntegrations, type IntegrationApp, type IntegrationPreset, type IntegrationUsage } from "../api";
 import { ProviderTile } from "../provider-logo";
 
 const USAGE_TEXT: Record<IntegrationUsage, string> = {
@@ -93,6 +94,15 @@ function SshKeyCard({ configured }: { configured: boolean }) {
 }
 
 function AppCard({ app }: { app: IntegrationApp }) {
+  const queryClient = useQueryClient();
+  const disconnect = async () => {
+    try {
+      await disconnectMcpIntegration(queryClient, app.slug);
+      toast.success("Personal Console connection disconnected.");
+    } catch (error) {
+      toast.error(errorMessage(error));
+    }
+  };
   const needsReconnect = app.connection?.status === "needs_reconnect";
   return (
     <Card label={app.slug}>
@@ -111,6 +121,13 @@ function AppCard({ app }: { app: IntegrationApp }) {
         </p>
       )}
       <p className="text-xs text-muted-foreground">{USAGE_TEXT[app.usage]}</p>
+      {app.mcp_resource && (
+        <div className="space-y-1 text-xs text-muted-foreground">
+          <p className="font-medium text-foreground">Remote MCP</p>
+          <code className="block break-all">{app.mcp_resource}</code>
+          <p>New Codex sessions use your personally owned connection when your personal principal has access. Account connection does not prove MCP connectivity. Provider permissions determine allowed actions.</p>
+        </div>
+      )}
       <div className="mt-auto flex items-center justify-between gap-3 pt-1">
         {app.connection ? (
           <>
@@ -123,6 +140,15 @@ function AppCard({ app }: { app: IntegrationApp }) {
               <Button asChild variant="secondary">
                 <a href={app.start_url}>Reconnect</a>
               </Button>
+              {app.can_disconnect_mcp && (
+                <ConfirmDialog
+                  trigger={<Button variant="outline">Disconnect</Button>}
+                  title={`Disconnect ${app.slug}?`}
+                  description="Removes all your saved Console accounts and their grants for this integration. Proxy sync removes those credentials. Other credentials and provider-side tokens remain unchanged."
+                  confirmLabel="Disconnect"
+                  onConfirm={disconnect}
+                />
+              )}
             </div>
             <span
               className={cn(

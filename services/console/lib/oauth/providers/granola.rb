@@ -32,6 +32,7 @@ module Oauth
       def token_endpoint = TOKEN_ENDPOINT
       def identity_scopes = IDENTITY_SCOPES
       def api_hosts = API_HOSTS
+      def mcp_resource = "https://mcp.granola.ai/mcp"
       def authorization_scope_param = "scope"
       def scope_separator = " "
       def extra_authorization_params = {}
