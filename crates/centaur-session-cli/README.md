@@ -48,7 +48,7 @@ centaur config set client-id "$CENTAUR_CLIENT_ID"
 centaur login
 ```
 
-Login prompts without echo, verifies the secret with `/oauth/token`, and saves it in `~/.config/centaur/config.json` with permissions **0600**. This is a protected local file, not encrypted storage. Use a protected device/account and disk encryption. `CENTAUR_CONFIG` overrides the path; otherwise `XDG_CONFIG_HOME` is honored. Atomic config replacement uses `/tmp`; a cross-filesystem rename fails safely without replacing the old config.
+Login prompts without echo, verifies the secret with `/oauth/token`, and saves it in `~/.config/centaur/config.json` with permissions **0600**. This is a protected local file, not encrypted storage. Use a protected device/account and disk encryption. `CENTAUR_CONFIG` overrides the path; otherwise `XDG_CONFIG_HOME` is honored. Atomic config replacement uses a mode-0600 temporary file beside the config so the rename stays on the same filesystem.
 
 A secret manager can pipe the secret to `centaur login --secret-stdin`, or inject `CENTAUR_CLIENT_SECRET` without writing it to the config. Never put secrets in CLI arguments. Endpoint/client changes invalidate saved credentials; an environment endpoint override cannot silently reuse a credential saved for another endpoint. HTTP is accepted only on loopback for local tests; redirects are not followed.
 

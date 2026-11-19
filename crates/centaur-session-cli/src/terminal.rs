@@ -182,8 +182,8 @@ fn save_config(config: &Value) -> Result<()> {
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(std::path::Path::new("."));
     fs::create_dir_all(parent)?;
-    // Atomic replacement avoids truncating credentials; cross-device rename fails safely.
-    let temporary = PathBuf::from("/tmp").join(format!("centaur-config-{}.tmp", Uuid::new_v4()));
+    // Atomic replacement requires the temporary file to be on the same filesystem.
+    let temporary = parent.join(format!(".centaur-config-{}.tmp", Uuid::new_v4()));
     let result = (|| -> Result<()> {
         let mut file = fs::OpenOptions::new()
             .write(true)

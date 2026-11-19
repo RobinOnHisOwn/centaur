@@ -7,6 +7,7 @@ import http.server
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -141,6 +142,21 @@ class Configuration(unittest.TestCase):
         self.assertNotIn("fixture-secret", result.stdout + result.stderr)
         self.assertNotIn("fixture-access-token", result.stdout + result.stderr)
         return result
+
+    @unittest.skipUnless(shutil.which("strace"), "requires strace")
+    def test_atomic_config_replacement_uses_destination_directory(self):
+        trace = pathlib.Path(self.directory.name) / "rename.log"
+        result = subprocess.run(
+            ["strace", "-e", "trace=rename", "-o", str(trace), self.binary,
+             "config", "set", "endpoint", self.endpoint],
+            env=self.env, capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        renames = [line for line in trace.read_text().splitlines() if line.startswith("rename(")]
+        self.assertEqual(len(renames), 1)
+        source = json.loads(renames[0].split("(", 1)[1].split(", ", 1)[0])
+        self.assertEqual(pathlib.Path(source).parent, self.config.parent)
+        self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)
 
     def test_personal_mcp_reuses_native_connections_without_local_configuration(self):
         self.run_cli('login', '--secret-stdin', input='fixture-secret\n')
