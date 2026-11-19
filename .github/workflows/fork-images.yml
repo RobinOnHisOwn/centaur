@@ -1,0 +1,78 @@
+name: Publish fork images
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Full source commit SHA (empty uses the workflow commit)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: fork-images-${{ inputs.revision || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  images:
+    if: github.repository == 'RobinOnHisOwn/centaur'
+    runs-on: self-hosted
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - {component: api-rs, dockerfile: services/api-rs/Dockerfile}
+          - {component: console, dockerfile: services/console/Dockerfile}
+          - {component: proxy-sync, dockerfile: services/proxy-sync/Dockerfile}
+          - {component: token-broker, dockerfile: services/token-broker/Dockerfile}
+          - {component: iron-proxy, dockerfile: services/iron-proxy/Dockerfile}
+          - {component: agent, dockerfile: services/sandbox/Dockerfile}
+    steps:
+      - name: Validate immutable source selection
+        env:
+          REVISION: ${{ inputs.revision || github.sha }}
+        run: '[[ "$REVISION" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.revision || github.sha }}
+          persist-credentials: false
+      - name: Read checked-out source revision
+        id: source
+        run: |
+          revision=$(git rev-parse HEAD)
+          {
+            echo "revision=$revision"
+            echo "image=ghcr.io/${GITHUB_REPOSITORY,,}/centaur-${{ matrix.component }}:$revision"
+          } >> "$GITHUB_OUTPUT"
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | buildah login --authfile "$RUNNER_TEMP/centaur-registry.json" --username "${{ github.actor }}" --password-stdin ghcr.io
+      - name: Build pinned source with rootless buildah
+        run: |
+          buildah build --arch amd64 --jobs 1 \
+            --build-arg TARGETARCH=amd64 --build-arg RUST_BUILD_PROFILE=release \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label org.opencontainers.image.revision=${{ steps.source.outputs.revision }} \
+            --file ${{ matrix.dockerfile }} \
+            --tag "${{ steps.source.outputs.image }}" .
+      - name: Push versioned image (does not deploy)
+        run: |
+          buildah push --authfile "$RUNNER_TEMP/centaur-registry.json" \
+            --digestfile "$RUNNER_TEMP/centaur-${{ matrix.component }}.digest" \
+            "${{ steps.source.outputs.image }}" "docker://${{ steps.source.outputs.image }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: centaur-${{ matrix.component }}-digest
+          path: ${{ runner.temp }}/centaur-${{ matrix.component }}.digest
+      - name: Remove registry credentials
+        if: always()
+        run: rm -f -- "$RUNNER_TEMP/centaur-registry.json"
