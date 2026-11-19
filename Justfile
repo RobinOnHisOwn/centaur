@@ -23,6 +23,19 @@ agent_image := env_var_or_default("CENTAUR_AGENT_IMAGE", "centaur-agent:latest")
 default:
     just --list
 
+# Build the terminal client in release mode.
+client-build:
+    cargo build --locked --release -p centaur-session-cli
+
+# Install the terminal client. Override CENTAUR_CLIENT_BIN_DIR if needed.
+client-install: client-build
+    mkdir -p "${CENTAUR_CLIENT_BIN_DIR:-$HOME/.local/bin}"
+    install -m 755 target/release/centaur-session-cli "${CENTAUR_CLIENT_BIN_DIR:-$HOME/.local/bin}/centaur"
+
+# Remove the installed terminal client.
+client-uninstall:
+    rm -f "${CENTAUR_CLIENT_BIN_DIR:-$HOME/.local/bin}/centaur"
+
 build:
     #!/usr/bin/env bash
     set -euo pipefail
