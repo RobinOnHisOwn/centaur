@@ -2,6 +2,7 @@
   lib,
   rustPlatform,
   aws-lc,
+  cacert,
   pkg-config,
   src,
 }:
@@ -17,6 +18,10 @@ rustPlatform.buildRustPackage {
 
   nativeBuildInputs = [pkg-config];
   buildInputs = [aws-lc];
+
+  preCheck = ''
+    export SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt
+  '';
 
   postInstall = ''
     mv "$out/bin/centaur-session-cli" "$out/bin/centaur"
