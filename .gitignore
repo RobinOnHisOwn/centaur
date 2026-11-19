@@ -81,3 +81,5 @@ _
 
 # Rust
 /target/
+
+.codegraph/
