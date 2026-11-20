@@ -33,7 +33,10 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::protocol::UserInput;
-use crate::server::{BlocksCommand, BlocksState, parse_blocks_line_with_state, write_blocks_error};
+use crate::server::{
+    BlocksCommand, BlocksState, accept_interrupt, execution_identity, execution_ready,
+    parse_blocks_line_with_state, write_blocks_error,
+};
 use crate::traits::{
     NormalizedContent, NormalizedEvent, NormalizedTokenUsage, NormalizedToolResult,
 };
@@ -69,7 +72,7 @@ pub fn run_hermes_blocks_server() -> Result<()> {
                 continue;
             }
             let sent = match parse_blocks_line_with_state(trimmed, &mut blocks_state) {
-                Ok(BlocksCommand::Interrupt) => interrupt_tx.send(()).is_ok(),
+                Ok(BlocksCommand::Interrupt(target)) => interrupt_tx.send(target).is_ok(),
                 Ok(command) => command_tx.send(Ok(command)).is_ok(),
                 Err(error) => command_tx.send(Err(error.to_string())).is_ok(),
             };
@@ -95,6 +98,7 @@ pub fn run_hermes_blocks_server() -> Result<()> {
                 trace_context,
             }) => {
                 turn += 1;
+                execution_ready(&mut stdout, Some(&trace_context))?;
                 crate::session_prompt::run_session_prompt_hooks(Some(&trace_context), "hermes");
                 let result = ensure_child(&mut hermes, model).and_then(|child| {
                     run_hermes_turn(
@@ -105,20 +109,19 @@ pub fn run_hermes_blocks_server() -> Result<()> {
                         reasoning,
                         turn,
                         &interrupt_rx,
+                        execution_identity(Some(&trace_context)),
                     )
                 });
                 if let Err(error) = result {
                     eprintln!("Hermes blocks turn failed: {error:#}");
                     write_blocks_error(&mut stdout, &thread_id, "turn", error.to_string())?;
-                    // A dead gateway cannot serve the next turn; drop it so the
-                    // next message restarts Hermes and resumes the durable
-                    // session via HERMES_CONTINUE_SESSION_ID.
-                    if hermes.as_mut().is_some_and(|child| !child.is_alive()) {
-                        hermes = None;
-                    }
+                    // An uncertain turn (including failed cancellation) must
+                    // never share its pending requests with a successor.
+                    // Restart/resume through HERMES_CONTINUE_SESSION_ID.
+                    hermes = None;
                 }
             }
-            Ok(BlocksCommand::Interrupt) => {
+            Ok(BlocksCommand::Interrupt(_)) => {
                 eprintln!("Hermes blocks interrupt ignored: no active turn runs");
             }
             Ok(BlocksCommand::AttachmentChunk) => {}
@@ -255,10 +258,6 @@ impl HermesChild {
         this.wait_for_gateway_ready()?;
         this.create_or_resume_session(model)?;
         Ok(this)
-    }
-
-    fn is_alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
     }
 
     fn thread_id(&self) -> &str {
@@ -508,6 +507,7 @@ fn tool_result_text(payload: &Value) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_hermes_turn<W: Write>(
     child: &mut HermesChild,
     stdout: &mut W,
@@ -515,7 +515,8 @@ fn run_hermes_turn<W: Write>(
     client_user_message_id: Option<String>,
     reasoning: Option<String>,
     turn: u64,
-    interrupt_rx: &Receiver<()>,
+    interrupt_rx: &Receiver<Option<String>>,
+    execution_id: Option<&str>,
 ) -> Result<()> {
     let mut config = BridgeConfig::new(child.thread_id().to_string(), format!("turn-{turn}"));
     config.cli_version = "hermes".to_string();
@@ -539,20 +540,33 @@ fn run_hermes_turn<W: Write>(
     child.send_request("prompt.submit", params)?;
 
     loop {
-        if interrupt_rx.try_recv().is_ok() {
+        while let Ok(target) = interrupt_rx.try_recv() {
+            if !accept_interrupt(stdout, target.as_deref(), execution_id)? {
+                continue;
+            }
             let params = json!({"session_id": child.session_id});
             let _ = child.rpc("session.interrupt", params);
             // Hermes ends the interrupted turn with its own terminal frame;
             // drain until it arrives (bounded) so it can't leak into the
             // next turn as an instant terminal.
             let deadline = Instant::now() + INTERRUPT_DRAIN_TIMEOUT;
+            let mut terminal = false;
             while let Ok(frame) = child.read_frame_until(deadline) {
                 if normalize_hermes_frame(turn, &frame)
                     .iter()
                     .any(NormalizedEvent::is_terminal)
                 {
+                    terminal = true;
                     break;
                 }
+            }
+            if !terminal {
+                // Never reuse a gateway whose cancellation is still pending.
+                child.child.kill()?;
+                child.child.wait()?;
+                return Err(HarnessServerError::Protocol(
+                    "interrupt terminal frame timed out; gateway stopped".into(),
+                ));
             }
             if let Some(notification) = normalizer.finish_turn_interrupted()? {
                 write_value(stdout, &notification_to_wire_value(&notification)?)?;

@@ -21,8 +21,21 @@ class McpOauthRefreshToken < ApplicationRecord
 
   scope :usable, -> { where(revoked_at: nil).where("expires_at > ?", Time.current) }
 
+  # Serialize rotation and disconnect across processes. Revoked ancestors stay
+  # usable as revocation handles, but never as refresh credentials.
+  def with_connection_lock
+    self.class.transaction do
+      self.class.connection.execute(self.class.sanitize_sql_array([
+        "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", "mcp-connection:#{connection_id}"
+      ]))
+      yield
+    end
+  end
+
   def revoke!
-    update!(revoked_at: Time.current)
+    with_connection_lock do
+      self.class.where(connection_id: connection_id).update_all(revoked_at: Time.current, updated_at: Time.current)
+    end
   end
 
   private

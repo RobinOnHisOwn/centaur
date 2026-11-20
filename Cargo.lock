@@ -600,6 +600,7 @@ dependencies = [
  "sqids",
  "sqlx",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

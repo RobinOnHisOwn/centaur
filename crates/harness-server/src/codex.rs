@@ -16,8 +16,8 @@ use self::citations::CodexCitationFilter;
 use crate::otel::{TurnStatus as TelemetryTurnStatus, TurnTelemetry};
 use crate::protocol::UserInput;
 use crate::server::{
-    BlocksCommand, BlocksState, parse_blocks_line_with_state, usage_span_input_value,
-    write_blocks_error,
+    BlocksCommand, BlocksState, accept_interrupt, execution_identity, execution_ready,
+    parse_blocks_line_with_state, usage_span_input_value, write_blocks_error,
 };
 use crate::{AppServerRuntime, HarnessServerError, Result};
 
@@ -157,9 +157,9 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
                 }
 
                 match parse_blocks_line_with_state(trimmed, &mut blocks_state) {
-                    Ok(BlocksCommand::Interrupt) if turn_active.load(Ordering::SeqCst) => {
+                    Ok(BlocksCommand::Interrupt(target)) if turn_active.load(Ordering::SeqCst) => {
                         if active_turn_tx
-                            .send(CodexActiveTurnRequest::Interrupt)
+                            .send(CodexActiveTurnRequest::Interrupt(target))
                             .is_err()
                         {
                             break;
@@ -227,6 +227,7 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
             }) => {
                 crate::session_prompt::run_session_prompt_hooks(Some(&trace_context), "codex");
                 let traceparent = trace_context.effective_traceparent();
+                execution_ready(&mut stdout, Some(&trace_context))?;
                 let requested_provider = provider
                     .as_deref()
                     .map(str::trim)
@@ -331,6 +332,7 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
                         &active_turn_rx,
                         traceparent.as_deref(),
                         &mut telemetry,
+                        execution_identity(Some(&trace_context)),
                     )
                 })();
                 telemetry.finish(if result.is_ok() {
@@ -356,7 +358,7 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
                     write_blocks_error(&mut stdout, fallback_thread_id, "turn", error.to_string())?;
                 }
             }
-            CodexBlocksReaderInput::Command(BlocksCommand::Interrupt) => {
+            CodexBlocksReaderInput::Command(BlocksCommand::Interrupt(_)) => {
                 eprintln!("Codex blocks interrupt ignored: no active turn runs");
             }
             CodexBlocksReaderInput::Command(BlocksCommand::AttachmentChunk) => {}
@@ -381,7 +383,7 @@ enum CodexBlocksReaderInput {
 }
 
 enum CodexActiveTurnRequest {
-    Interrupt,
+    Interrupt(Option<String>),
     Steer {
         input: Vec<UserInput>,
         client_user_message_id: Option<String>,
@@ -433,6 +435,7 @@ fn run_codex_user_turn<W: Write>(
     active_turn_rx: &Receiver<CodexActiveTurnRequest>,
     traceparent: Option<&str>,
     telemetry: &mut TurnTelemetry,
+    execution_id: Option<&str>,
 ) -> Result<()> {
     let (model, model_provider) = model_and_provider;
     if thread_id.is_none() {
@@ -508,6 +511,7 @@ fn run_codex_user_turn<W: Write>(
             request_id,
             traceparent,
             telemetry,
+            execution_id,
         )? {
             TurnTermination::Done => return Ok(()),
             TurnTermination::RetriableEngineError { withheld } => {
@@ -820,6 +824,7 @@ impl CodexJsonRpcChild {
         request_id: &mut i64,
         traceparent: Option<&str>,
         telemetry: &mut TurnTelemetry,
+        execution_id: Option<&str>,
     ) -> Result<TurnTermination> {
         let mut guard = TurnGuard::default();
         let mut interrupt_request_id = None;
@@ -833,6 +838,8 @@ impl CodexJsonRpcChild {
                 thread_id,
                 turn_id,
                 traceparent,
+                execution_id,
+                stdout,
             )?;
             let value = match self.read_value_timeout(Duration::from_millis(50))? {
                 Some(value) => value,
@@ -889,7 +896,7 @@ impl CodexJsonRpcChild {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward_pending_active_turn_requests(
+    fn forward_pending_active_turn_requests<W: Write>(
         &mut self,
         active_turn_rx: &Receiver<CodexActiveTurnRequest>,
         interrupt_request_id: &mut Option<i64>,
@@ -898,10 +905,15 @@ impl CodexJsonRpcChild {
         thread_id: &str,
         turn_id: &str,
         traceparent: Option<&str>,
+        execution_id: Option<&str>,
+        stdout: &mut W,
     ) -> Result<()> {
         while let Ok(request) = active_turn_rx.try_recv() {
             match request {
-                CodexActiveTurnRequest::Interrupt => {
+                CodexActiveTurnRequest::Interrupt(target) => {
+                    if !accept_interrupt(stdout, target.as_deref(), execution_id)? {
+                        continue;
+                    }
                     if interrupt_request_id.is_some() {
                         eprintln!("Codex blocks interrupt ignored: interrupt already requested");
                         continue;

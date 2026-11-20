@@ -22,8 +22,11 @@ use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use uuid::Uuid;
 
+mod delegation;
 mod mcp;
 mod migrations;
+
+pub use delegation::DelegatedTurn;
 
 pub use migrations::{TextSearchBackend, migrate, migration_list};
 
@@ -420,6 +423,11 @@ impl PgSessionStore {
         thread_key: &ThreadKey,
         messages: &[SessionMessageInput],
     ) -> Result<Vec<String>, SessionStoreError> {
+        if thread_key.as_str().starts_with("personal:") {
+            return Err(SessionStoreError::InvalidTurn(
+                "personal sessions require atomic turn submission".into(),
+            ));
+        }
         let mut tx = self.pool.begin().await?;
         let mut message_ids = Vec::with_capacity(messages.len());
 
@@ -541,6 +549,11 @@ impl PgSessionStore {
         metadata: Value,
         request: Value,
     ) -> Result<CreateExecutionResult, SessionStoreError> {
+        if thread_key.as_str().starts_with("personal:") {
+            return Err(SessionStoreError::InvalidTurn(
+                "personal sessions require atomic turn submission".into(),
+            ));
+        }
         let execution_id = prefixed_id("exe");
         let row = sqlx::query_as::<_, CreateExecutionRow>(
             r#"
@@ -2177,6 +2190,12 @@ pub enum SessionStoreError {
     },
     #[error("invalid persisted value: {0}")]
     InvalidPersistedValue(String),
+    #[error("invalid delegated turn: {0}")]
+    InvalidTurn(String),
+    #[error("request ID {request_id} was already used with a different payload")]
+    RequestConflict { request_id: String },
+    #[error("delegated execution admission limit reached for {owner}")]
+    AdmissionLimited { owner: String },
     #[error("session execution not found for execution_id {execution_id}")]
     ExecutionNotFound { execution_id: String },
     #[error("session {thread_key} has an active execution {execution_id}")]

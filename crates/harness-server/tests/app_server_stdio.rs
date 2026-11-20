@@ -1018,6 +1018,54 @@ fn fake_codex_blocks_mode_queues_active_turns_in_order() {
 }
 
 #[test]
+fn fake_codex_targeted_interrupt_rejects_a_delayed_previous_execution() {
+    let script = temp_path("targeted-codex.sh");
+    let log = temp_path("targeted-codex.jsonl");
+    std::fs::write(&script, fake_codex_interruptible_app_server_script(&log)).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut bridge = BridgeProcess::spawn_harness_blocks(
+        Harness::Codex,
+        None,
+        Some(("CODEX_BIN", script.to_str().unwrap())),
+    );
+    for id in ["exe_A", "exe_B"] {
+        bridge.send(json!({"type":"user","trace_metadata":{"execution_id":id},"message":{"role":"user","content":[{"type":"text","text":"hang"}]}}));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if bridge.read_json(deadline)["method"] == "turn/started" {
+                break;
+            }
+        }
+        if id == "exe_B" {
+            bridge.send(json!({"type":"interrupt_execution","execution_id":"exe_A"}));
+            loop {
+                let event = bridge.read_json(deadline);
+                assert_ne!(event["method"], "turn/completed");
+                if event["method"] == "centaur/interruptRejected" {
+                    break;
+                }
+            }
+        }
+        bridge.send(json!({"type":"interrupt_execution","execution_id":id}));
+        assert_eq!(
+            bridge.read_blocks_turn(deadline).terminal_status.as_deref(),
+            Some("interrupted")
+        );
+    }
+    bridge.finish_successfully();
+    let requests = read_requests(&log);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|v| v["method"] == "turn/interrupt")
+            .count(),
+        2
+    );
+    std::fs::remove_file(script).unwrap();
+    std::fs::remove_file(log).unwrap();
+}
+
+#[test]
 fn fake_codex_blocks_mode_interrupts_active_turn() {
     let fake_codex = temp_path("fake-interruptible-codex.sh");
     let fake_codex_log = temp_path("fake-interruptible-codex-requests.jsonl");

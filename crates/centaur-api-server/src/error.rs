@@ -58,9 +58,18 @@ impl IntoResponse for ApiError {
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Runtime(SessionRuntimeError::BadRequest(_)) => StatusCode::BAD_REQUEST,
             Self::Runtime(SessionRuntimeError::ShuttingDown) => StatusCode::SERVICE_UNAVAILABLE,
-            Self::Runtime(SessionRuntimeError::Store(SessionStoreError::NotFound { .. })) => {
-                StatusCode::NOT_FOUND
+            Self::Runtime(SessionRuntimeError::Store(
+                SessionStoreError::NotFound { .. } | SessionStoreError::ExecutionNotFound { .. },
+            )) => StatusCode::NOT_FOUND,
+            Self::Runtime(SessionRuntimeError::Store(SessionStoreError::InvalidTurn(_))) => {
+                StatusCode::BAD_REQUEST
             }
+            Self::Runtime(SessionRuntimeError::Store(SessionStoreError::RequestConflict {
+                ..
+            })) => StatusCode::CONFLICT,
+            Self::Runtime(SessionRuntimeError::Store(SessionStoreError::AdmissionLimited {
+                ..
+            })) => StatusCode::TOO_MANY_REQUESTS,
             Self::Runtime(SessionRuntimeError::Store(SessionStoreError::HarnessConflict {
                 ..
             })) => StatusCode::CONFLICT,
@@ -163,6 +172,41 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use centaur_iron_control::{IronControlError, PrincipalDerivationError};
+
+    #[test]
+    fn delegated_turn_errors_have_stable_http_statuses() {
+        for (error, status) in [
+            (
+                SessionStoreError::InvalidTurn("invalid cursor".into()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                SessionStoreError::RequestConflict {
+                    request_id: "retry".into(),
+                },
+                StatusCode::CONFLICT,
+            ),
+            (
+                SessionStoreError::AdmissionLimited {
+                    owner: "personal:owner:".into(),
+                },
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                SessionStoreError::ExecutionNotFound {
+                    execution_id: "other".into(),
+                },
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            assert_eq!(
+                ApiError::Runtime(SessionRuntimeError::Store(error))
+                    .into_response()
+                    .status(),
+                status
+            );
+        }
+    }
 
     #[test]
     fn principal_derivation_errors_are_bad_requests() {

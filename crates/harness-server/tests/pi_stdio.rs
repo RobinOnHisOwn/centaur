@@ -102,6 +102,116 @@ fn status(turn: &[Value]) -> &Value {
 }
 
 #[test]
+fn targeted_interrupt_cannot_cancel_a_successor() {
+    use std::os::unix::process::CommandExt;
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                // The test owns this fresh process group, including fake CLIs.
+                unsafe {
+                    libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+                }
+                let _ = self.0.wait();
+            }
+        }
+    }
+    for kind in ["pi", "hermes"] {
+        let dir = std::env::temp_dir().join(format!("pi-targeted-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hermes = dir.join("fake-hermes");
+        std::fs::write(
+            &hermes,
+            r#"#!/usr/bin/env python3
+import json, sys, os
+def emit(v): print(json.dumps(v), flush=True)
+def event(kind): emit({'method':'event','params':{'type':kind,'payload':{}}})
+event('gateway.ready')
+for line in sys.stdin:
+    q=json.loads(line)
+    emit({'id':q['id'],'result':{'session_id':'test-session'}})
+    if q['method']=='prompt.submit' and q['params']['text']=='bad stdout':
+        os.write(1, b'\xff\n')
+        continue
+    if q['method']=='session.interrupt': event('message.complete')
+    if q['method']=='prompt.submit' and 'slow' not in q['params']['text']: event('message.complete')
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&hermes, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_harness-server"))
+            .process_group(0)
+            .arg(kind)
+            .env("CENTAUR_PI_BIN", fake_pi(&dir))
+            .env("HERMES_PYTHON", hermes)
+            .env("HERMES_CRON_TICK_SECONDS", "0")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("CENTAUR_PI_MODEL")
+            .env_remove("HERMES_CONTINUE_SESSION_ID")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let mut guard = ChildGuard(child);
+        let child = &mut guard.0;
+        let (tx, rx) = mpsc::channel();
+        let stdout = child.stdout.take().unwrap();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if tx
+                    .send(serde_json::from_str::<Value>(&line).unwrap())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let mut server = Server {
+            stdin: child.stdin.take().unwrap(),
+            stdout: rx,
+        };
+        let first = server.turn("first", json!({"trace_metadata":{"execution_id":"exe_A"}}));
+        assert_eq!(status(&first), "completed");
+        assert!(first.iter().any(|v| v["method"] == "centaur/executionReady"
+            && v["params"]["execution_id"] == "exe_A"
+            && v["params"]["targeted_interrupt"] == 1));
+        server.user("slow", json!({"trace_metadata":{"execution_id":"exe_B"}}));
+        server.read_until("turn/started");
+        // Release A's delayed command only after B has started consuming input.
+        server.send(json!({"type":"interrupt_execution","execution_id":"exe_A"}));
+        let rejected = server.read_until("centaur/interruptRejected");
+        assert!(!rejected.iter().any(|v| v["method"] == "turn/completed"));
+        server.send(json!({"type":"interrupt_execution","execution_id":"exe_B"}));
+        assert_eq!(status(&server.read_until("turn/completed")), "interrupted");
+        // Duplicate B must not kill a new turn either.
+        server.user("slow", json!({"trace_metadata":{"execution_id":"exe_C"}}));
+        server.read_until("turn/started");
+        server.send(json!({"type":"interrupt_execution","execution_id":"exe_B"}));
+        let rejected = server.read_until("centaur/interruptRejected");
+        assert!(!rejected.iter().any(|v| v["method"] == "turn/completed"));
+        server.send(json!({"type":"interrupt_execution","execution_id":"exe_C"}));
+        assert_eq!(status(&server.read_until("turn/completed")), "interrupted");
+        if kind == "hermes" {
+            server.user(
+                "bad stdout",
+                json!({"trace_metadata":{"execution_id":"exe_D"}}),
+            );
+            server.read_until("error");
+            let recovered = server.turn(
+                "recovered",
+                json!({"trace_metadata":{"execution_id":"exe_E"}}),
+            );
+            assert_eq!(status(&recovered), "completed");
+        }
+        drop(server);
+        child.wait().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
 fn pi_blocks_turns_render_tools_and_codemode_and_respawn_on_model_change_and_interrupt() {
     let dir: PathBuf = std::env::temp_dir().join(format!("pi-stdio-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();

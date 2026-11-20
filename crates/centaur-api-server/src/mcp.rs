@@ -119,6 +119,9 @@ struct McpToolCallOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct McpPrincipal {
     token_id: String,
+    connection_id: Option<String>,
+    console_user_id: Option<String>,
+    oauth_client_id: Option<String>,
     principal_id: String,
     console_user_email: Option<String>,
     console_user_name: Option<String>,
@@ -135,6 +138,34 @@ pub(crate) async fn mcp_post(
     let Some(principal) = authenticate_mcp_bearer(&headers)? else {
         return Ok(mcp_unauthorized(&headers));
     };
+    if let Some(connection_id) = &principal.connection_id {
+        let (Some(user), Some(client)) = (&principal.console_user_id, &principal.oauth_client_id)
+        else {
+            return Ok(mcp_unauthorized(&headers));
+        };
+        let identity = centaur_console_db::mcp_connection_identity(
+            &state.console_db()?,
+            connection_id,
+            user,
+            &principal.principal_id,
+            client,
+            &mcp_resource_url(&headers),
+            &principal.scopes,
+        )
+        .await
+        .map_err(|_| ApiError::ServiceUnavailable("MCP authorization is unavailable".into()))?;
+        if identity.is_none() {
+            return Ok(mcp_unauthorized(&headers));
+        }
+    } else if principal
+        .scopes
+        .iter()
+        .any(|scope| scope.starts_with("mcp:sessions:"))
+    {
+        // Catalog-only legacy tokens remain compatible until their expiry;
+        // delegation never accepts expiry-only or unbound credentials.
+        return Ok(mcp_unauthorized(&headers));
+    }
     if request.jsonrpc.as_deref().unwrap_or("2.0") != "2.0" {
         return Ok(mcp_json_error(
             request.id.unwrap_or(Value::Null),
@@ -1338,6 +1369,10 @@ struct McpJwtHeader {
 #[derive(Debug, Deserialize)]
 struct McpJwtClaims {
     aud: Value,
+    #[serde(default)]
+    connection_id: Option<String>,
+    #[serde(default)]
+    client_id: Option<String>,
     exp: i64,
     #[serde(default)]
     iat: Option<i64>,
@@ -1434,13 +1469,16 @@ fn verify_mcp_jwt(token: &str, headers: &HeaderMap) -> Result<Option<McpPrincipa
     let name = first_non_empty_owned([
         console_user_name.clone(),
         console_user_email.clone(),
-        claims.sub,
+        claims.sub.clone(),
         Some(claims.principal_id.clone()),
     ])
     .unwrap_or_else(|| claims.principal_id.clone());
 
     Ok(Some(McpPrincipal {
         token_id,
+        connection_id: claims.connection_id,
+        console_user_id: claims.sub,
+        oauth_client_id: claims.client_id,
         principal_id: claims.principal_id,
         console_user_email,
         console_user_name,
@@ -1997,6 +2035,133 @@ def search(query, limit=20):
     }
 
     #[test]
+    fn hosted_mcp_rejects_an_unexpired_token_immediately_after_disconnect() {
+        let Ok(url) = env::var("SESSION_RUNTIME_TEST_DATABASE_URL") else {
+            assert!(env::var_os("CI").is_none(), "session database required");
+            eprintln!("skipping: SESSION_RUNTIME_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            ("CENTAUR_JWT_SIGNING_SECRET", "test-secret"),
+            ("CENTAUR_MCP_PUBLIC_URL", "http://localhost:3000/mcp"),
+            ("CENTAUR_CONSOLE_PUBLIC_URL", "http://localhost:3001"),
+        ]);
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let schema = format!("mcp_connection_{}", uuid::Uuid::new_v4().simple());
+            let admin = sqlx::PgPool::connect(&url).await.unwrap();
+            sqlx::query(&format!("CREATE SCHEMA {schema}"))
+                .execute(&admin)
+                .await
+                .unwrap();
+            let path = schema.clone();
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .after_connect(move |connection, _| {
+                    let sql = format!("SET search_path TO {path}");
+                    Box::pin(async move {
+                        sqlx::query(&sql).execute(connection).await?;
+                        Ok(())
+                    })
+                })
+                .connect(&url)
+                .await
+                .unwrap();
+            // Query shape is separately tested against Rails' actual schema.
+            sqlx::raw_sql(
+                r#"
+                CREATE TABLE users (id bigint, status text);
+                CREATE TABLE principals (id bigint, kind text, console_user_id bigint);
+                CREATE TABLE mcp_oauth_clients (id bigint, scopes jsonb);
+                CREATE TABLE mcp_oauth_refresh_tokens (connection_id uuid, user_id bigint,
+                    principal_id bigint, mcp_oauth_client_id bigint, resource text, scopes jsonb,
+                    revoked_at timestamptz, expires_at timestamptz);
+                INSERT INTO users VALUES (1,'active');
+                INSERT INTO principals VALUES (2,'console_user',1);
+                INSERT INTO mcp_oauth_clients VALUES (3,'["mcp:sessions:read"]');
+                INSERT INTO mcp_oauth_refresh_tokens VALUES
+                    ('00000000-0000-4000-8000-000000000001',1,2,3,'http://localhost:3000/mcp',
+                     '["mcp:sessions:read"]',NULL,now()+interval '1 day');
+            "#,
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            let state = AppState::unready(crate::auth::ApiAuthConfig::testing("test-secret"))
+                .with_console_db(pool.clone());
+            let token = test_jwt(
+                "test-secret",
+                json!({
+                    "iss": "http://localhost:3001", "sub": centaur_console_db::oid("usr", 1),
+                    "client_id": centaur_console_db::oid("moc", 3),
+                    "connection_id": "00000000-0000-4000-8000-000000000001",
+                    "aud": "http://localhost:3000/mcp",
+                    "exp": OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                    "principal_id": centaur_console_db::oid("prn", 2), "scope": "mcp:sessions:read",
+                }),
+            );
+            for expected in [StatusCode::OK, StatusCode::UNAUTHORIZED] {
+                let response = mcp_post(
+                    State(state.clone()),
+                    mcp_auth_headers(&token),
+                    Json(McpJsonRpcRequest {
+                        jsonrpc: Some("2.0".into()),
+                        id: Some(json!(1)),
+                        method: "ping".into(),
+                        params: json!({}),
+                    }),
+                )
+                .await
+                .unwrap();
+                assert_eq!(response.status(), expected);
+                sqlx::query("UPDATE mcp_oauth_refresh_tokens SET revoked_at=now()")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            pool.close().await;
+            sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+                .execute(&admin)
+                .await
+                .unwrap();
+            admin.close().await;
+        });
+    }
+
+    #[test]
+    fn session_tokens_require_a_live_connection_even_for_ping() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            ("CENTAUR_JWT_SIGNING_SECRET", "test-secret"),
+            ("CENTAUR_MCP_PUBLIC_URL", "http://localhost:3000/mcp"),
+            ("CENTAUR_CONSOLE_PUBLIC_URL", "http://localhost:3001"),
+        ]);
+        let state = AppState::unready(crate::auth::ApiAuthConfig::testing("test-secret"));
+        let token = test_jwt(
+            "test-secret",
+            json!({
+                "iss": "http://localhost:3001", "sub": "usr_test",
+                "aud": "http://localhost:3000/mcp",
+                "exp": OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                "principal_id": "prn_test", "scope": "mcp:sessions:read"
+            }),
+        );
+        let response = mcp_post(
+            State(state),
+            mcp_auth_headers(&token),
+            Json(McpJsonRpcRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(1)),
+                method: "ping".into(),
+                params: json!({}),
+            }),
+        )
+        .now_or_never()
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
     fn mcp_jwt_rejects_wrong_audience() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _env = EnvGuard::set(&[
@@ -2435,6 +2600,9 @@ def search(query, limit=20):
         let state = AppState::unready(crate::auth::ApiAuthConfig::testing("test-secret"));
         let principal = McpPrincipal {
             token_id: "test-token".to_owned(),
+            connection_id: None,
+            console_user_id: None,
+            oauth_client_id: None,
             principal_id: "prn_test".to_owned(),
             console_user_email: None,
             console_user_name: None,

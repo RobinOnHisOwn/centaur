@@ -26,6 +26,13 @@
     </div>
   </dl>
 
+  <% if @scopes.include?("mcp:sessions:read") %>
+    <p>Read your shared sessions and their output, including work started from other connected clients.</p>
+  <% end %>
+  <% if @scopes.include?("mcp:sessions:write") %>
+    <p>Start, continue and interrupt your shared sessions. Accepted work runs on the server and may consume resources after you disconnect.</p>
+  <% end %>
+
   <%= form_with url: "/mcp/oauth/authorize", method: :post, class: "oauth-form" do %>
     <% @authorization_params.each do |key, value| %>
       <%= hidden_field_tag key, value %>

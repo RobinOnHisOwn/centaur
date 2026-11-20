@@ -33,6 +33,7 @@ post "mcp/oauth/register", to: "mcp/oauth#register"
 get "mcp/oauth/authorize", to: "mcp/oauth#authorize"
 post "mcp/oauth/authorize", to: "mcp/oauth#approve"
 post "mcp/oauth/token", to: "mcp/oauth#token"
+post "mcp/oauth/revoke", to: "mcp/oauth#revoke"
 
 # OAuth consent flow, keyed by the app's well-known slug (/oauth/google/start).
 # Requires an active console session; the provider is derived from the app.

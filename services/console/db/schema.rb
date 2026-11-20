@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_11_09_021725) do
+ActiveRecord::Schema[8.1].define(version: 2026_11_20_125247) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -243,6 +243,8 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_09_021725) do
     t.string "token_hash", null: false
     t.datetime "updated_at", null: false
     t.bigint "user_id", null: false
+    t.uuid "connection_id", default: -> { "gen_random_uuid()" }, null: false
+    t.index ["connection_id"], name: "index_mcp_oauth_refresh_tokens_on_connection_id"
     t.index ["expires_at"], name: "index_mcp_oauth_refresh_tokens_on_expires_at"
     t.index ["mcp_oauth_client_id"], name: "index_mcp_oauth_refresh_tokens_on_mcp_oauth_client_id"
     t.index ["principal_id"], name: "index_mcp_oauth_refresh_tokens_on_principal_id"

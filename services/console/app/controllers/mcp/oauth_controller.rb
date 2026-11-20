@@ -13,11 +13,11 @@ module Mcp
     layout "oauth"
     include ServerRenderedPagePolicy
 
-    skip_before_action :require_login, only: %i[metadata register authorize token]
-    skip_before_action :require_active_account, only: %i[metadata register authorize token]
+    skip_before_action :require_login, only: %i[metadata register authorize token revoke]
+    skip_before_action :require_active_account, only: %i[metadata register authorize token revoke]
     # RFC 6749 section 5.1: token responses, errors included, must not be cached.
-    before_action :prevent_token_caching, only: :token
-    skip_forgery_protection only: %i[register token]
+    before_action :prevent_token_caching, only: %i[token revoke]
+    skip_forgery_protection only: %i[register token revoke]
 
     ACCESS_TOKEN_TTL_SECONDS = 1.hour.to_i
 
@@ -28,11 +28,13 @@ module Mcp
         authorization_endpoint: URI.join(public_base_url, "/mcp/oauth/authorize").to_s,
         token_endpoint: URI.join(public_base_url, "/mcp/oauth/token").to_s,
         registration_endpoint: URI.join(public_base_url, "/mcp/oauth/register").to_s,
+        revocation_endpoint: URI.join(public_base_url, "/mcp/oauth/revoke").to_s,
         response_types_supported: [ "code" ],
         grant_types_supported: McpOauthClient::DEFAULT_GRANT_TYPES,
         code_challenge_methods_supported: [ "S256" ],
         token_endpoint_auth_methods_supported: [ "none" ],
-        scopes_supported: McpOauthClient::DEFAULT_SCOPES,
+        revocation_endpoint_auth_methods_supported: [ "none" ],
+        scopes_supported: McpOauthClient::SUPPORTED_SCOPES,
         resource_parameter_supported: true
       }
     end
@@ -116,6 +118,18 @@ module Mcp
       end
     end
 
+    # RFC 7009: the public client proves possession of its refresh credential.
+    # Unknown/already revoked credentials produce the same empty success.
+    def revoke
+      client = resolve_client(params[:client_id])
+      return oauth_error(:invalid_client, "Unknown client.", status: :unauthorized) unless client
+      return oauth_error(:invalid_request, "token is required.", status: :bad_request) if params[:token].blank?
+
+      token = client.refresh_tokens.find_by(token_hash: McpOauthRefreshToken.hash_token(params[:token]))
+      token&.revoke!
+      head :ok
+    end
+
     private
 
     def validated_authorization_request
@@ -148,7 +162,7 @@ module Mcp
       end
 
       scopes = normalize_scope_param(params[:scope], McpOauthClient::DEFAULT_SCOPES)
-      unsupported = scopes - McpOauthClient::DEFAULT_SCOPES
+      unsupported = scopes - (client.scopes & McpOauthClient::SUPPORTED_SCOPES)
       if unsupported.any?
         return authorization_request_error(
           client,
@@ -292,7 +306,8 @@ module Mcp
         principal: code.principal,
         resource: code.resource,
         scopes: code.scopes,
-        refresh_token: refresh.plaintext_token
+        refresh_token: refresh.plaintext_token,
+        connection_id: refresh.connection_id
       )
     end
 
@@ -318,7 +333,7 @@ module Mcp
       rotated = nil
       invalid_grant = false
       inactive_user = false
-      McpOauthRefreshToken.transaction do
+      refresh.with_connection_lock do
         refresh.lock!
         if refresh.revoked_at.present? || refresh.expires_at <= Time.current
           invalid_grant = true
@@ -332,7 +347,8 @@ module Mcp
             user: refresh.user,
             principal: refresh.principal,
             resource: refresh.resource,
-            scopes: refresh.scopes
+            scopes: refresh.scopes,
+            connection_id: refresh.connection_id
           )
         end
       end
@@ -358,11 +374,12 @@ module Mcp
         principal: refresh.principal,
         resource: refresh.resource,
         scopes: refresh.scopes,
-        refresh_token: rotated.plaintext_token
+        refresh_token: rotated.plaintext_token,
+        connection_id: rotated.connection_id
       )
     end
 
-    def render_token_response(client:, user:, principal:, resource:, scopes:, refresh_token:)
+    def render_token_response(client:, user:, principal:, resource:, scopes:, refresh_token:, connection_id:)
       now = Time.current.to_i
       ttl = access_token_ttl_seconds
       payload = {
@@ -375,6 +392,7 @@ module Mcp
         jti: "mcpjwt_#{SecureRandom.hex(16)}",
         scope: scopes.join(" "),
         client_id: client.public_client_id,
+        connection_id: connection_id,
         principal_id: principal.oid,
         principal_foreign_id: principal.foreign_id,
         email: user.email,

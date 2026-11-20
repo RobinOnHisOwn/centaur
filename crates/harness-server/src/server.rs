@@ -42,6 +42,44 @@ use crate::util::{absolute_path, default_codex_home, write_value};
 use crate::wire::notification_to_wire_value;
 use crate::{HarnessServerError, Result};
 
+pub(crate) fn execution_identity(trace: Option<&TraceContext>) -> Option<&str> {
+    trace?
+        .metadata
+        .get("execution_id")?
+        .as_str()
+        .filter(|id| !id.trim().is_empty() && id.len() <= 128)
+}
+
+pub(crate) fn execution_ready<W: Write>(
+    stdout: &mut W,
+    trace: Option<&TraceContext>,
+) -> Result<()> {
+    if let Some(id) = execution_identity(trace) {
+        write_value(
+            stdout,
+            &json!({"jsonrpc":"2.0","method":"centaur/executionReady","params":{"execution_id":id,"targeted_interrupt":1}}),
+        )?;
+    }
+    Ok(())
+}
+
+/// Must run in the turn consumer, not the stdin reader: queues can outlive A.
+/// None is exclusively the legacy untargeted command, never a malformed target.
+pub(crate) fn accept_interrupt<W: Write>(
+    stdout: &mut W,
+    target: Option<&str>,
+    active: Option<&str>,
+) -> Result<bool> {
+    if target.is_some() && target != active {
+        write_value(
+            stdout,
+            &json!({"jsonrpc":"2.0","method":"centaur/interruptRejected","params":{"execution_id":target,"reason":"not_active"}}),
+        )?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 pub fn server_for(kind: HarnessKind) -> Box<dyn AppServerRuntime> {
     match kind {
         HarnessKind::Codex => Box::new(CodexHarnessServer::codex()),
@@ -88,8 +126,11 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
                 }
 
                 match parse_blocks_line_with_state(trimmed, &mut blocks_state) {
-                    Ok(BlocksCommand::Interrupt) if turn_active.load(Ordering::SeqCst) => {
-                        if request_tx.send(ActiveTurnRequest::BlocksInterrupt).is_err() {
+                    Ok(BlocksCommand::Interrupt(target)) if turn_active.load(Ordering::SeqCst) => {
+                        if request_tx
+                            .send(ActiveTurnRequest::BlocksInterrupt(target))
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -166,7 +207,7 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
                     write_blocks_error(&mut stdout, &state.id, "turn", error.to_string())?;
                 }
             }
-            BlocksReaderInput::Command(BlocksCommand::Interrupt) => {
+            BlocksReaderInput::Command(BlocksCommand::Interrupt(_)) => {
                 eprintln!("blocks interrupt ignored: no active turn runs");
             }
             BlocksReaderInput::Command(BlocksCommand::AttachmentChunk) => {}
@@ -223,7 +264,7 @@ pub(crate) fn run_app_server<H: HarnessServer>(harness: &H) -> Result<()> {
                     eprintln!("request failed: {error:#}");
                 }
             }
-            ActiveTurnRequest::BlocksInterrupt => {
+            ActiveTurnRequest::BlocksInterrupt(_) => {
                 eprintln!("blocks interrupt ignored: no active turn runs");
             }
         }
@@ -273,7 +314,7 @@ enum BlocksReaderInput {
 
 enum ActiveTurnRequest {
     JsonRpc(JSONRPCRequest),
-    BlocksInterrupt,
+    BlocksInterrupt(Option<String>),
 }
 
 fn drain_active_turn_requests(rx: &Receiver<ActiveTurnRequest>) {
@@ -291,7 +332,7 @@ pub(crate) enum BlocksCommand {
         reasoning: Option<String>,
         trace_context: TraceContext,
     },
-    Interrupt,
+    Interrupt(Option<String>),
     AttachmentChunk,
 }
 
@@ -312,6 +353,8 @@ struct StagedAttachment {
 struct BlocksLine {
     #[serde(rename = "type")]
     kind: String,
+    #[serde(default)]
+    execution_id: Option<String>,
     #[serde(default)]
     message: Option<BlocksMessage>,
     #[serde(default)]
@@ -484,7 +527,16 @@ pub(crate) fn parse_blocks_line_with_state(
             handle_attachment_chunk(parsed, state)?;
             Ok(BlocksCommand::AttachmentChunk)
         }
-        "interrupt" => Ok(BlocksCommand::Interrupt),
+        "interrupt" => Ok(BlocksCommand::Interrupt(None)),
+        "interrupt_execution" => {
+            let target = parsed
+                .execution_id
+                .filter(|id| !id.trim().is_empty() && id.len() <= 128)
+                .ok_or_else(|| HarnessServerError::InvalidBlocksInput {
+                    message: "interrupt_execution requires a bounded execution_id".into(),
+                })?;
+            Ok(BlocksCommand::Interrupt(Some(target)))
+        }
         kind => Err(HarnessServerError::InvalidBlocksInput {
             message: format!("unsupported blocks input type `{kind}`"),
         }),
@@ -1060,10 +1112,17 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
     normalizer: &mut CodexTurnNormalizer,
     request: ActiveTurnRequest,
     stdout: &mut W,
+    execution_id: Option<&str>,
 ) -> Result<bool> {
-    let ActiveTurnRequest::JsonRpc(request) = request else {
-        process.kill_and_wait()?;
-        return Ok(true);
+    let request = match request {
+        ActiveTurnRequest::JsonRpc(request) => request,
+        ActiveTurnRequest::BlocksInterrupt(target) => {
+            if !accept_interrupt(stdout, target.as_deref(), execution_id)? {
+                return Ok(false);
+            }
+            process.kill_and_wait()?;
+            return Ok(true);
+        }
     };
 
     match request.method.as_str() {
@@ -1170,6 +1229,7 @@ fn run_normalized_turn<H: HarnessServer, W: Write>(
         write_value(stdout, &notification_to_wire_value(&notification)?)?;
     }
 
+    execution_ready(stdout, trace_context)?;
     let mut telemetry = TurnTelemetry::new(
         trace_context,
         harness.kind(),
@@ -1186,6 +1246,7 @@ fn run_normalized_turn<H: HarnessServer, W: Write>(
         stdout,
         request_rx,
         &mut telemetry,
+        execution_identity(trace_context),
     ) {
         Ok(Some(turn)) => {
             telemetry.finish(TelemetryTurnStatus::Completed);
@@ -1245,6 +1306,7 @@ fn finish_turn_with_error<W: Write>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_harness_turn<H: HarnessServer, W: Write>(
     harness: &H,
     state: &mut ThreadState,
@@ -1253,6 +1315,7 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
     stdout: &mut W,
     request_rx: &Receiver<ActiveTurnRequest>,
     telemetry: &mut TurnTelemetry,
+    execution_id: Option<&str>,
 ) -> Result<Option<Turn>> {
     ensure_harness_process(harness, state)?;
     {
@@ -1294,7 +1357,21 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                 .process
                 .as_mut()
                 .ok_or(HarnessServerError::HarnessStdinUnavailable)?;
-            if handle_active_turn_request(harness, process, normalizer, request, stdout)? {
+            // Reject before touching the child or turn timers. A delayed A
+            // interrupt must be a complete no-op while B is running.
+            if let ActiveTurnRequest::BlocksInterrupt(Some(ref target)) = request
+                && !accept_interrupt(stdout, Some(target), execution_id)?
+            {
+                continue;
+            }
+            if handle_active_turn_request(
+                harness,
+                process,
+                normalizer,
+                request,
+                stdout,
+                execution_id,
+            )? {
                 state.process = None;
                 return Err(HarnessServerError::TurnInterrupted {
                     kind: harness.kind(),
@@ -1572,6 +1649,28 @@ pub(crate) fn write_blocks_error<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn targeted_interrupt_requires_identity_and_never_downgrades() {
+        for value in [
+            json!({}),
+            json!({"execution_id":null}),
+            json!({"execution_id":""}),
+            json!({"execution_id":"  "}),
+            json!({"execution_id":"x".repeat(129)}),
+            json!({"execution_id":7}),
+        ] {
+            let mut value = value;
+            value["type"] = json!("interrupt_execution");
+            assert!(parse_blocks_line(&value.to_string()).is_err());
+        }
+        let mut output = Vec::new();
+        assert!(!accept_interrupt(&mut output, Some("exe_A"), None).unwrap());
+        assert!(!accept_interrupt(&mut output, Some("exe_A"), Some("exe_B")).unwrap());
+        assert!(accept_interrupt(&mut output, Some("exe_B"), Some("exe_B")).unwrap());
+        assert!(accept_interrupt(&mut output, None, Some("exe_B")).unwrap());
+        assert_eq!(String::from_utf8(output).unwrap().lines().count(), 2);
+    }
 
     fn temp_upload_dir() -> PathBuf {
         let path = env::temp_dir().join(format!("harness-server-test-{}", Uuid::new_v4().simple()));

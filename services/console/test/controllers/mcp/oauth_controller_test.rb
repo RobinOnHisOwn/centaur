@@ -43,6 +43,8 @@ module Mcp
       assert_equal "http://www.example.com/mcp/oauth/token", body.fetch("token_endpoint")
       assert_equal "http://www.example.com/mcp/oauth/register", body.fetch("registration_endpoint")
       assert_includes body.fetch("code_challenge_methods_supported"), "S256"
+      assert_equal "http://www.example.com/mcp/oauth/revoke", body.fetch("revocation_endpoint")
+      assert_equal [ "none" ], body.fetch("revocation_endpoint_auth_methods_supported")
     end
 
     test "dynamic client registration creates a public PKCE client" do
@@ -728,6 +730,76 @@ module Mcp
 
       exchange_authorization_code(client, code)
       assert_response :ok
+    end
+
+    test "session scopes require explicit registration and consent" do
+      post "/mcp/oauth/register", params: {
+        client_name: "Session client", redirect_uris: [ redirect_uri ],
+        scope: "mcp:sessions:read mcp:sessions:write"
+      }, as: :json
+      assert_response :created
+      assert_equal "mcp:sessions:read mcp:sessions:write", JSON.parse(response.body).fetch("scope")
+
+      client = create_client
+      console_password_login(@operator.email)
+      get "/mcp/oauth/authorize", params: authorize_params(client).merge(scope: "mcp:sessions:write")
+      assert_response :redirect
+      assert_equal "invalid_scope", Rack::Utils.parse_nested_query(URI.parse(response.location).query)["error"]
+      client.update!(scopes: %w[mcp:sessions:read mcp:sessions:write])
+      get "/mcp/oauth/authorize", params: authorize_params(client).merge(scope: "mcp:sessions:read mcp:sessions:write")
+      assert_response :ok
+      assert_select "p", text: /Read your shared sessions and their output/
+      assert_select "p", text: /Start, continue and interrupt your shared sessions/
+    end
+
+    test "connection survives rotation and revoke disables only that connection" do
+      client = create_client
+      exchange_authorization_code(client, authorize_code(client))
+      first = JSON.parse(response.body)
+      connection = decode_jwt_payload(first.fetch("access_token"))["connection_id"]
+      assert connection.present?, "access tokens must identify their durable connection"
+
+      exchange_authorization_code(client, authorize_code(client))
+      other = JSON.parse(response.body)
+      assert_not_equal connection, decode_jwt_payload(other.fetch("access_token"))["connection_id"]
+
+      post "/mcp/oauth/token", params: {
+        grant_type: "refresh_token", client_id: client.public_client_id, refresh_token: first.fetch("refresh_token")
+      }
+      assert_response :ok
+      rotated = JSON.parse(response.body)
+      assert_equal connection, decode_jwt_payload(rotated.fetch("access_token")).fetch("connection_id")
+
+      post "/mcp/oauth/revoke", params: { client_id: create_client.public_client_id, token: rotated.fetch("refresh_token") }
+      assert_response :ok
+      assert_equal 1, McpOauthRefreshToken.usable.where(connection_id: connection).count
+
+      # A retained token from before rotation must still be able to disconnect
+      # its whole connection, without disconnecting the user's other client.
+      post "/mcp/oauth/revoke", params: { client_id: client.public_client_id, token: first.fetch("refresh_token") }
+      assert_response :ok
+      assert_equal 0, McpOauthRefreshToken.usable.where(connection_id: connection).count
+      post "/mcp/oauth/token", params: {
+        grant_type: "refresh_token", client_id: client.public_client_id, refresh_token: rotated.fetch("refresh_token")
+      }
+      assert_response :bad_request
+      post "/mcp/oauth/token", params: {
+        grant_type: "refresh_token", client_id: client.public_client_id, refresh_token: other.fetch("refresh_token")
+      }
+      assert_response :ok
+    end
+
+    test "revocation validates the public client and required token" do
+      post "/mcp/oauth/revoke", params: { client_id: "unknown", token: "unknown" }
+      assert_response :unauthorized
+      post "/mcp/oauth/revoke", params: { client_id: create_client.public_client_id }
+      assert_response :bad_request
+    end
+
+    test "revocation is idempotent and does not reveal unknown tokens" do
+      post "/mcp/oauth/revoke", params: { client_id: create_client.public_client_id, token: "unknown" }
+      assert_response :ok
+      assert_empty response.body
     end
 
     private

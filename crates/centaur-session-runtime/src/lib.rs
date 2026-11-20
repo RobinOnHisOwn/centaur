@@ -497,6 +497,14 @@ pub struct InterruptExecutionOutcome {
     pub execution_id: Option<String>,
 }
 
+/// `requested` means written to stdin, not acknowledged or terminally cancelled.
+#[derive(Clone, Debug)]
+pub struct TargetedInterruptOutcome {
+    pub requested: bool,
+    pub interrupted: bool,
+    pub execution_id: String,
+}
+
 #[derive(Debug)]
 pub struct ToolHostCallInput {
     pub principal_id: String,
@@ -2799,6 +2807,89 @@ impl SessionRuntime {
             })
     }
 
+    /// Read only the requested execution's public status, not the latest turn.
+    pub async fn execution_snapshot(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+    ) -> Result<Value, SessionRuntimeError> {
+        Ok(self
+            .store
+            .execution_snapshot(thread_key, execution_id)
+            .await?)
+    }
+
+    pub async fn execution_result_page(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        after_event_id: i64,
+        limit: i64,
+    ) -> Result<Value, SessionRuntimeError> {
+        Ok(self
+            .store
+            .execution_result_page(thread_key, execution_id, after_event_id, limit)
+            .await?)
+    }
+
+    /// Durable delegated turns never pass through append_messages' steering
+    /// path. The ordinary execution driver and startup recovery own the work.
+    pub async fn enqueue_delegated_turn(
+        &self,
+        thread_key: &ThreadKey,
+        owner_prefix: &str,
+        message: SessionMessageInput,
+        mut input: ExecuteSessionInput,
+        max_active: i64,
+        submissions_per_minute: i64,
+    ) -> Result<SessionExecution, SessionRuntimeError> {
+        let _admission = self.execution_admission.read().await;
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(SessionRuntimeError::ShuttingDown);
+        }
+        input.max_duration_ms = Some(input.max_duration_ms.unwrap_or(3_600_000));
+        if input.max_duration_ms > Some(3_600_000) {
+            return Err(SessionRuntimeError::BadRequest(
+                "delegated executions are limited to one hour".into(),
+            ));
+        }
+        validate_input_lines(&input.input_lines)?;
+        let _ = duration_options(input.idle_timeout_ms, input.max_duration_ms)?;
+        let request_id = input
+            .idempotency_key
+            .as_deref()
+            .ok_or_else(|| SessionRuntimeError::BadRequest("request_id is required".into()))?;
+        let session = self.store.get_session(thread_key).await?;
+        let execution = self
+            .store
+            .submit_delegated_turn(
+                thread_key,
+                centaur_session_sqlx::DelegatedTurn {
+                    owner_prefix,
+                    request_id,
+                    message,
+                    request: persisted_execute_request(&input)?,
+                    metadata: execution_metadata(
+                        input.metadata.clone(),
+                        input.idle_timeout_ms,
+                        input.max_duration_ms,
+                        self.persona_model(&session),
+                    ),
+                    max_active,
+                    submissions_per_minute,
+                },
+            )
+            .await?;
+        if execution.execution.status == ExecutionStatus::Queued {
+            self.spawn_session_execution(
+                thread_key.clone(),
+                execution.execution.execution_id.clone(),
+                input,
+            );
+        }
+        Ok(execution.execution)
+    }
+
     /// Persist an execution request and return before sandbox provisioning or
     /// stdin delivery. The queued row is the durable handoff boundary for HTTP
     /// callers: a background driver handles the live attempt, while the
@@ -3107,11 +3198,87 @@ impl SessionRuntime {
         }
     }
 
+    /// Cancel a queued execution or request execution-bound running cancellation.
+    /// Never downgrade to the legacy untargeted protocol.
+    pub async fn interrupt_execution(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        reason: &str,
+    ) -> Result<TargetedInterruptOutcome, SessionRuntimeError> {
+        if !thread_key.as_str().starts_with("personal:") || reason.len() > 1024 {
+            return Err(SessionRuntimeError::BadRequest(
+                "invalid targeted interruption".into(),
+            ));
+        }
+        let snapshot = self
+            .store
+            .execution_snapshot(thread_key, execution_id)
+            .await?;
+        let outcome = |requested, interrupted| TargetedInterruptOutcome {
+            requested,
+            interrupted,
+            execution_id: execution_id.to_owned(),
+        };
+        if !matches!(snapshot["status"].as_str(), Some("queued" | "running")) {
+            return Ok(outcome(false, snapshot["status"] == "cancelled"));
+        }
+        if self
+            .store
+            .cancel_queued_execution(thread_key, execution_id)
+            .await?
+        {
+            return Ok(outcome(true, true));
+        }
+        let pipe = self
+            .wait_for_active_steering_pipe(thread_key, execution_id)
+            .await
+            .map_err(SessionRuntimeError::BadRequest)?;
+        let supported = match pipe.instance_id.as_deref() {
+            Some(instance) => {
+                self.store
+                    .supports_execution_interrupt(thread_key, execution_id, instance)
+                    .await?
+            }
+            None => false,
+        };
+        if !supported {
+            return Err(SessionRuntimeError::BadRequest(
+                "running tasks require sandbox support for execution-bound interruption".into(),
+            ));
+        }
+        let line = json!({"type":"interrupt_execution","execution_id":execution_id}).to_string();
+        timeout(
+            Duration::from_secs(5),
+            write_input_lines(&pipe, &[line], thread_key, execution_id, None),
+        )
+        .await
+        .map_err(|_| {
+            SessionRuntimeError::BadRequest(
+                "interrupt delivery timed out; outcome unknown, inspect execution status".into(),
+            )
+        })??;
+        self.store
+            .append_event(
+                thread_key,
+                Some(execution_id),
+                "session.interrupt_requested",
+                json!({"reason":reason}),
+            )
+            .await?;
+        Ok(outcome(true, false))
+    }
+
     pub async fn interrupt_active_execution(
         &self,
         thread_key: &ThreadKey,
         reason: &str,
     ) -> Result<InterruptExecutionOutcome, SessionRuntimeError> {
+        if thread_key.as_str().starts_with("personal:") {
+            return Err(SessionRuntimeError::BadRequest(
+                "personal session interruption requires an execution ID".into(),
+            ));
+        }
         let Some(execution) = self.store.active_execution_for_thread(thread_key).await? else {
             return Ok(InterruptExecutionOutcome {
                 interrupted: false,
@@ -5088,8 +5255,15 @@ fn spawn_stdout_pump_loop(state: StdoutPumpLoop) {
         let mut last_reattach_detail = "stdout reattach attempts exhausted".to_owned();
 
         'pump: loop {
-            let result =
-                run_stdout_pump(ctx.clone(), thread_key.clone(), &sandbox_id, stdout, guard).await;
+            let result = run_stdout_pump(
+                ctx.clone(),
+                thread_key.clone(),
+                &sandbox_id,
+                stdout,
+                guard,
+                pipe.instance_id.as_deref(),
+            )
+            .await;
             let (execution, lines_pumped) = match result {
                 Ok(StdoutPumpEnd::Idle) => break,
                 Ok(StdoutPumpEnd::EofActiveExecution {
@@ -5461,6 +5635,7 @@ async fn run_stdout_pump(
     sandbox_id: &str,
     stdout: SandboxRead,
     _guard: SandboxIoGuard,
+    instance_id: Option<&str>,
 ) -> Result<StdoutPumpEnd, SessionRuntimeError> {
     let span = info_span!(
         "centaur.api_rs.session.stdout_pump",
@@ -5537,6 +5712,7 @@ async fn run_stdout_pump(
                 &thread_key,
                 &output_execution_id,
                 &line,
+                instance_id,
             )
             .instrument(output_span.clone())
             .await?
@@ -7253,10 +7429,15 @@ fn input_line_with_session_context(
         let trace_metadata = map
             .entry("trace_metadata")
             .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !trace_metadata.is_object() {
+            *trace_metadata = json!({});
+        }
         if let Value::Object(metadata) = trace_metadata {
-            metadata
-                .entry("execution_id")
-                .or_insert_with(|| Value::String(execution_id.to_owned()));
+            // Now a cancellation authority, not caller-controlled tracing data.
+            metadata.insert(
+                "execution_id".into(),
+                Value::String(execution_id.to_owned()),
+            );
         }
     }
     if let Some(capabilities) = capabilities {
@@ -7452,6 +7633,7 @@ async fn append_output_line(
     thread_key: &ThreadKey,
     execution_id: &str,
     line: &str,
+    instance_id: Option<&str>,
 ) -> Result<Option<SessionEvent>, SessionRuntimeError> {
     let safe_line = redact_sensitive_text(line);
     let event = ctx
@@ -7465,6 +7647,23 @@ async fn append_output_line(
             Value::String(safe_line),
         )
         .await?;
+    if event.is_some()
+        && let Ok(value) = serde_json::from_str::<Value>(line)
+        && value["method"] == "centaur/executionReady"
+        && value["params"]["execution_id"] == execution_id
+        && value["params"]["targeted_interrupt"] == 1
+    {
+        ctx.store
+            .append_event_if_stdout_owner(
+                thread_key,
+                execution_id,
+                &ctx.stdout_owner_id,
+                STDOUT_OWNER_LEASE,
+                "session.interrupt_capability",
+                json!({"version":1,"sandbox_instance_id":instance_id}),
+            )
+            .await?;
+    }
     Ok(event)
 }
 
@@ -9446,7 +9645,7 @@ mod tests {
             &thread_key,
             &trace,
             None,
-            r#"{"type":"user","trace_metadata":{"action":"execute"}}"#,
+            r#"{"type":"user","trace_metadata":{"action":"execute","execution_id":"forged-previous-execution"}}"#,
         );
         let value: Value = serde_json::from_str(&line).unwrap();
 
@@ -10910,6 +11109,201 @@ mod adoption_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegated_turn_commits_before_dispatch_and_preserves_recovery_request() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let owner = format!("personal:{}:", uuid::Uuid::new_v4());
+        let key = ThreadKey::parse(format!("{owner}test")).unwrap();
+        store
+            .create_or_get_session(
+                &key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let gate = backend.hold_create();
+        let (io, mut stdout, stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend.clone());
+        let message = SessionMessageInput {
+            client_message_id: Some("request-1".into()),
+            role: MessageRole::User,
+            parts: vec![json!({"type":"text","text":"hello"})],
+            metadata: json!({}),
+        };
+        let input = ExecuteSessionInput {
+            idempotency_key: Some("request-1".into()),
+            metadata: None,
+            input_lines: vec![
+                json!({"type":"user","message":{"content":message.parts}}).to_string(),
+            ],
+            idle_timeout_ms: None,
+            max_duration_ms: None,
+        };
+        let mut unbounded = input.clone();
+        unbounded.max_duration_ms = Some(3_600_001);
+        assert!(
+            runtime
+                .enqueue_delegated_turn(&key, &owner, message.clone(), unbounded, 4, 20)
+                .await
+                .is_err()
+        );
+        assert!(store.list_messages(&key).await.unwrap().is_empty());
+        let execution = timeout(
+            Duration::from_secs(1),
+            runtime.enqueue_delegated_turn(&key, &owner, message.clone(), input.clone(), 4, 20),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(store.list_messages(&key).await.unwrap().len(), 1);
+        let recovered = runtime
+            .load_persisted_execute_request(&execution.execution_id)
+            .await
+            .unwrap();
+        assert_eq!(recovered.input_lines, input.input_lines);
+        assert_eq!(recovered.max_duration_ms, Some(3_600_000));
+        timeout(Duration::from_secs(1), backend.create_started.notified())
+            .await
+            .unwrap();
+        let mut changed = input.clone();
+        changed.input_lines = vec!["changed".into()];
+        assert!(
+            runtime
+                .enqueue_delegated_turn(&key, &owner, message.clone(), changed, 4, 20)
+                .await
+                .is_err()
+        );
+        assert_eq!(store.list_messages(&key).await.unwrap().len(), 1);
+        gate.notify_one();
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = tokio::io::BufReader::new(stdin).lines();
+        timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            runtime
+                .interrupt_active_execution(&key, "untargeted")
+                .await
+                .is_err()
+        );
+        let error = runtime
+            .interrupt_execution(&key, &execution.execution_id, "test")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("execution-bound interruption"));
+        assert!(
+            timeout(Duration::from_millis(100), lines.next_line())
+                .await
+                .is_err()
+        );
+        // An unknown advertised version must not enable the protocol.
+        stdout.write_all(format!("{}\n",json!({"method":"centaur/executionReady","params":{"execution_id":execution.execution_id,"targeted_interrupt":2}})).as_bytes()).await.unwrap();
+        wait_for_event(&store, &key, "session.output.line").await;
+        assert!(
+            runtime
+                .interrupt_execution(&key, &execution.execution_id, "unsupported version")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("execution-bound interruption")
+        );
+        stdout.write_all(format!("{}\n",json!({"jsonrpc":"2.0","method":"centaur/executionReady","params":{"execution_id":execution.execution_id,"targeted_interrupt":1}})).as_bytes()).await.unwrap();
+        wait_for_event(&store, &key, "session.interrupt_capability").await;
+        let requested = runtime
+            .interrupt_execution(&key, &execution.execution_id, "test")
+            .await
+            .unwrap();
+        assert!(requested.requested);
+        assert!(
+            !requested.interrupted,
+            "stdin delivery is not confirmed cancellation"
+        );
+        assert!(
+            !store
+                .supports_execution_interrupt(&key, &execution.execution_id, "different-instance")
+                .await
+                .unwrap()
+        );
+        let line = timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let command: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(command["type"], "interrupt_execution");
+        assert_eq!(command["execution_id"], execution.execution_id);
+        stdout
+            .write_all(b"{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"test-thread\",\"turn\":{\"id\":\"test-turn\",\"status\":\"interrupted\"}}}\n")
+            .await
+            .unwrap();
+        wait_for_event(&store, &key, "session.execution_cancelled").await;
+        assert_eq!(backend.created_specs().len(), 1);
+        let (next_io, mut next_stdout, next_stdin) = mock_io();
+        backend.push_io(next_io).await;
+        let mut lines = tokio::io::BufReader::new(next_stdin).lines();
+        let mut next_input = input;
+        next_input.idempotency_key = Some("request-2".into());
+        let mut next_message = message;
+        next_message.client_message_id = Some("request-2".into());
+        let successor = runtime
+            .enqueue_delegated_turn(&key, &owner, next_message, next_input, 4, 20)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            !runtime
+                .interrupt_execution(&key, &execution.execution_id, "stale")
+                .await
+                .unwrap()
+                .requested
+        );
+        assert!(
+            timeout(Duration::from_millis(100), lines.next_line())
+                .await
+                .is_err()
+        );
+        // A's capability cannot authorize B, even in the same sandbox.
+        assert!(
+            runtime
+                .interrupt_execution(&key, &successor.execution_id, "missing capability")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("execution-bound interruption")
+        );
+        next_stdout
+            .write_all(&completed_output_bytes("successor result"))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), async {
+            while store
+                .execution_snapshot(&key, &successor.execution_id)
+                .await
+                .unwrap()["status"]
+                != "completed"
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn enqueue_returns_after_durable_commit_without_waiting_for_sandbox() {
         let Some(store) = test_store().await else {
             return;
@@ -11003,10 +11397,10 @@ mod adoption_tests {
             let (io, stdout, stdin) = mock_io();
             backend.push_io(io).await;
             outputs.push(stdout);
-            inputs.push(stdin);
+            inputs.push(FramedRead::new(stdin, LinesCodec::new()));
         }
         let runtime = runtime_with(&store, backend.clone());
-        for key in &keys {
+        for (index, key) in keys.iter().enumerate() {
             store
                 .create_or_get_session(key, &HarnessType::Pi, None, json!({}), Default::default())
                 .await
@@ -11017,6 +11411,18 @@ mod adoption_tests {
                 idle_timeout_ms: None, max_duration_ms: None,
             }).await.unwrap();
             wait_for_event(&store, key, "session.execution_started").await;
+            // Started is emitted before sandbox allocation. Wait for actual
+            // stdin delivery so the FIFO mock I/O belongs to this session and
+            // cannot be consumed by the next concurrent session's attach.
+            let input = timeout(Duration::from_secs(5), inputs[index].next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&input).unwrap()["thread_key"],
+                key.as_str()
+            );
             let reader = runtime.stream_events(key, 0, None).await.unwrap();
             drop(reader);
         }
