@@ -12,7 +12,7 @@ rustPlatform.buildRustPackage {
 
   inherit src;
 
-  cargoHash = "sha256-ryx+/fMKgPgkyC72TcftjRcGCE3CecPMAO6zR+Nbidc=";
+  cargoHash = "sha256-eozPUFLZewebaTSbrWrAzpfqe/CTwxVbmphKO+2XtKs=";
   cargoBuildFlags = ["--package=centaur-session-cli"];
   cargoTestFlags = ["--package=centaur-session-cli"];
 
