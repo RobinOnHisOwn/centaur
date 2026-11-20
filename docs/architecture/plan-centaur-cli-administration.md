@@ -8,7 +8,7 @@ status: Draft
 
 # Plan: Centaur CLI Administration Implementation Plan
 
-> **REQUIRED SUB-SKILL:** Use the executing-plans skill to implement this plan task-by-task. Implementation was authorized on 2026-11-20; phases 1–5 are locally implemented and verified. Phases 6–9 remain blocked by their explicit authentication decision. No commit, publication or deployment was requested.
+> **REQUIRED SUB-SKILL:** Use the executing-plans skill to implement this plan task-by-task. Implementation was authorized on 2026-11-20; phases 1–5 are locally implemented and verified. Phases 6–9 remain blocked by their explicit authentication decision. The first delivery was committed as `556c3fe5`; publication and deployment were not requested.
 
 **Goal:** Add explicit administration subcommands to the existing `centaur` executable, starting with supported operator APIs and preserving the option of a future Terraform/OpenTofu provider.
 
@@ -341,4 +341,4 @@ The single executable and command spelling are small reversible choices captured
 * [ ] Resolve authentication/admission gates and amend gated tasks with exact contracts.
 * [ ] Implement and verify phases 6–9 after their gates pass and implementation is authorized.
 
-First delivery implemented locally on `feat/cli-administration`. No real credentials or deployment state changed; the installed CLI was not replaced. No commit or publication performed. Console-only phases remain gated, so this plan stays Draft.
+First delivery implemented locally on `feat/cli-administration`. No real credentials or deployment state changed; the installed CLI was not replaced. The first delivery was committed as `556c3fe5`; it has not been published. Console-only phases remain gated, so this plan stays Draft.
