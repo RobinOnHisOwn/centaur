@@ -5,7 +5,7 @@ use centaur_api_server::{
     types::{AppendMessagesRequest, CreateSessionRequest, ExecuteSessionRequest},
 };
 use centaur_session_core::{HarnessType, MessageRole, SessionMessageInput, ThreadKey};
-use clap::{Parser, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum, parser::ValueSource};
 use eyre::{Result, WrapErr, bail, eyre};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -77,13 +77,19 @@ const DEFAULT_MESSAGE: &str = "Reply with exactly PONG and nothing else.";
 pub(crate) type SseFrame = ApiSseEvent;
 
 #[derive(Debug, Parser)]
-#[command(about = "Create, execute, or attach to a Centaur session")]
+#[command(
+    about = "Control remote Centaur chats; agents and tools run on the server",
+    after_help = "Start: config set endpoint <HTTPS-URL>, config set client-id <ID>, login, chat new.\nLegacy execution flags are for invocations without a subcommand.\nUse chat new --harness / --message / --max-duration-ms instead of root flags."
+)]
 struct Args {
     #[command(subcommand)]
     command: Option<terminal::Command>,
 
     #[arg(long, env = "CENTAUR_API_URL")]
     api_url: Option<ApiBaseUrl>,
+
+    #[arg(skip)]
+    api_url_source: Option<&'static str>,
 
     #[arg(
         long,
@@ -93,52 +99,117 @@ struct Args {
     )]
     api_token: String,
 
-    #[arg(long)]
+    /// Existing thread key; omit to generate one.
+    #[arg(long, help_heading = "Legacy execution (no subcommand)")]
     thread_key: Option<ThreadKeyArg>,
 
-    #[arg(long)]
+    /// Attach to an existing thread's events without an initial prompt.
+    #[arg(long, help_heading = "Legacy execution (no subcommand)")]
     attach: bool,
 
-    #[arg(long, value_enum, default_value = "codex")]
+    /// Harness for legacy session creation.
+    #[arg(
+        long,
+        value_enum,
+        default_value = "codex",
+        help_heading = "Legacy execution (no subcommand)"
+    )]
     harness_type: HarnessTypeArg,
 
-    #[arg(long)]
+    /// Initial prompt.
+    #[arg(long, help_heading = "Legacy execution (no subcommand)")]
     message: Option<String>,
 
-    #[arg(long = "input-line")]
+    /// Raw harness input line; may be repeated.
+    #[arg(long = "input-line", help_heading = "Legacy execution (no subcommand)")]
     input_lines: Vec<String>,
 
-    #[arg(long, default_value_t = 1_000)]
+    /// Legacy execution idle timeout in milliseconds.
+    #[arg(
+        long,
+        default_value_t = 1_000,
+        help_heading = "Legacy execution (no subcommand)"
+    )]
     idle_timeout_ms: u64,
 
-    #[arg(long, default_value_t = 60_000)]
+    /// Legacy execution deadline in milliseconds.
+    #[arg(
+        long,
+        default_value_t = 60_000,
+        help_heading = "Legacy execution (no subcommand)"
+    )]
     max_duration_ms: u64,
 
-    #[arg(long, default_value_t = 0)]
+    /// Resume event reading after this cursor.
+    #[arg(
+        long,
+        default_value_t = 0,
+        help_heading = "Legacy execution (no subcommand)"
+    )]
     after_event_id: i64,
 
-    #[arg(long)]
+    /// Include non-output events.
+    #[arg(long, help_heading = "Legacy execution (no subcommand)")]
     all_events: bool,
 
-    #[arg(long)]
+    /// Exit the reader on terminal execution events.
+    #[arg(long, help_heading = "Legacy execution (no subcommand)")]
     exit_on_terminal: bool,
 
-    #[arg(long)]
+    /// Exit the reader on this output type.
+    #[arg(long, help_heading = "Legacy execution (no subcommand)")]
     exit_on_output_type: Option<OutputEventType>,
 
-    #[arg(long, alias = "stdin")]
+    /// Read legacy message/raw-input commands from stdin.
+    #[arg(
+        long,
+        alias = "stdin",
+        help_heading = "Legacy execution (no subcommand)"
+    )]
     stdin_events: bool,
 
-    #[arg(long)]
+    /// Use the interactive terminal UI.
+    #[arg(long, help_heading = "Legacy execution (no subcommand)")]
     tui: bool,
 
-    #[arg(long)]
+    /// Initially show raw events in the terminal UI.
+    #[arg(long, help_heading = "Legacy execution (no subcommand)")]
     debug: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let matches = Args::command().get_matches();
+    if matches.subcommand_name().is_some() {
+        for id in [
+            "thread_key",
+            "attach",
+            "harness_type",
+            "message",
+            "input_lines",
+            "idle_timeout_ms",
+            "max_duration_ms",
+            "after_event_id",
+            "all_events",
+            "exit_on_terminal",
+            "exit_on_output_type",
+            "stdin_events",
+            "tui",
+            "debug",
+        ] {
+            if matches.value_source(id) == Some(ValueSource::CommandLine) {
+                Args::command().error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    format!("legacy execution option {id} cannot be combined with a subcommand; use the subcommand's --help (chat new uses --harness, --message and --max-duration-ms)"),
+                ).exit();
+            }
+        }
+    }
+    let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    args.api_url_source = matches.value_source("api_url").map(|source| match source {
+        ValueSource::CommandLine => "--api-url",
+        _ => "CENTAUR_API_URL",
+    });
     if let Some(command) = &args.command {
         return terminal::run(command, &args).await;
     }

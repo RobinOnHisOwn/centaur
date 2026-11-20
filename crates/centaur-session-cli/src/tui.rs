@@ -216,8 +216,7 @@ fn handle_terminal_event(
     notice_tx: mpsc::Sender<TuiNotice>,
 ) -> Result<bool> {
     if let TerminalInput::Paste(text) = &event {
-        app.input
-            .push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+        app.insert_input(&text.replace("\r\n", "\n").replace('\r', "\n"));
         return Ok(false);
     }
     let TerminalInput::Key(key) = event else {
@@ -236,7 +235,22 @@ fn handle_terminal_event(
             );
         }
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(true),
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => app.input.clear(),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input.clear();
+            app.input_cursor = 0;
+        }
+        KeyCode::Left => app.input_cursor = app.previous_input_char(),
+        KeyCode::Right => app.input_cursor = app.next_input_char(),
+        KeyCode::Home => {
+            app.input_cursor = app.input[..app.input_cursor]
+                .rfind('\n')
+                .map_or(0, |i| i + 1);
+        }
+        KeyCode::End => {
+            app.input_cursor += app.input[app.input_cursor..]
+                .find('\n')
+                .unwrap_or(app.input.len() - app.input_cursor);
+        }
         KeyCode::F(2) => app.toggle_debug(),
         KeyCode::PageUp => app.scroll = app.scroll.saturating_add(10),
         KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(10),
@@ -247,18 +261,24 @@ fn handle_terminal_event(
                 .modifiers
                 .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
         {
-            app.input.push('\n')
+            app.insert_input("\n")
         }
         KeyCode::Enter => {
             let line = app.input.trim().to_owned();
             app.input.clear();
+            app.input_cursor = 0;
             return submit_input_line(app, line, client, thread_key, options, notice_tx);
         }
         KeyCode::Backspace => {
-            app.input.pop();
+            let previous = app.previous_input_char();
+            app.input.drain(previous..app.input_cursor);
+            app.input_cursor = previous;
+        }
+        KeyCode::Delete => {
+            app.input.drain(app.input_cursor..app.next_input_char());
         }
         KeyCode::Char(ch) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
-            app.input.push(ch);
+            app.insert_input(ch.encode_utf8(&mut [0; 4]));
         }
         _ => {}
     }
@@ -368,9 +388,23 @@ async fn send_stdin_event(
     match event {
         StdinEvent::Message(text) => {
             let request = uuid::Uuid::new_v4().to_string();
-            crate::terminal::send_message(&client, &thread_key, &text, &request, max_duration_ms)
-                .await.wrap_err_with(|| format!("request_id={request}; check state before retrying with chat send --request-id"))?;
-            Ok(format!("message accepted (request_id={request})"))
+            let receipt = crate::terminal::send_message(
+                &client,
+                &thread_key,
+                &text,
+                &request,
+                max_duration_ms,
+            )
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "request_id={request}; check state before retrying with chat send --request-id"
+                )
+            })?;
+            Ok(format!(
+                "message accepted (execution={} status={} request_id={request})",
+                receipt.execution_id, receipt.status
+            ))
         }
         StdinEvent::InputLine(line) => {
             execute_input_lines(
@@ -593,12 +627,20 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         inner.width.saturating_sub(2).max(1),
         inner.height,
     );
-    let visible = visible_input(&app.input, content.width.saturating_sub(1).max(1) as usize);
+    let before = visible_input(
+        &app.input[..app.input_cursor],
+        content.width.saturating_sub(1).max(1) as usize,
+    );
+    let lines: Vec<_> = before.split('\n').collect();
+    let before = lines[lines.len().saturating_sub(content.height as usize)..].join("\n");
     let cursor_x = content.x
-        + (Line::raw(visible.rsplit('\n').next().unwrap_or("")).width() as u16)
+        + (Line::raw(before.rsplit('\n').next().unwrap_or("")).width() as u16)
             .min(content.width - 1);
-    let cursor_y = content.y + (visible.matches('\n').count() as u16).min(content.height - 1);
-    frame.render_widget(Paragraph::new(visible), content);
+    let cursor_y = content.y + (before.matches('\n').count() as u16).min(content.height - 1);
+    frame.render_widget(
+        Paragraph::new(format!("{before}{}", &app.input[app.input_cursor..])),
+        content,
+    );
     frame.set_cursor_position((cursor_x, cursor_y));
 }
 
@@ -751,6 +793,8 @@ struct TuiApp {
     running: bool,
     spinner: usize,
     input: String,
+    // ponytail: scalar-boundary cursor; use grapheme segmentation if combined-character editing is needed.
+    input_cursor: usize,
     main_lines: Vec<String>,
     debug_lines: Vec<String>,
     debug_visible: bool,
@@ -771,6 +815,7 @@ impl TuiApp {
             running: false,
             spinner: 0,
             input: String::new(),
+            input_cursor: 0,
             main_lines: Vec::new(),
             debug_lines: Vec::new(),
             debug_visible,
@@ -782,6 +827,26 @@ impl TuiApp {
             draft: String::new(),
             scroll: 0,
         }
+    }
+
+    fn insert_input(&mut self, text: &str) {
+        self.input.insert_str(self.input_cursor, text);
+        self.input_cursor += text.len();
+    }
+
+    fn previous_input_char(&self) -> usize {
+        self.input[..self.input_cursor]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(i, _)| i)
+    }
+
+    fn next_input_char(&self) -> usize {
+        self.input_cursor
+            + self.input[self.input_cursor..]
+                .chars()
+                .next()
+                .map_or(0, char::len_utf8)
     }
 
     fn recall_history(&mut self, previous: bool) {
@@ -803,6 +868,7 @@ impl TuiApp {
             .get(next)
             .cloned()
             .unwrap_or_else(|| self.draft.clone());
+        self.input_cursor = self.input.len();
     }
 
     fn clear(&mut self) {
@@ -1198,6 +1264,84 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("401 invalid x-api-key"))
         );
+    }
+
+    #[tokio::test]
+    async fn cursor_editing_preserves_unicode_paste_and_submitted_text() {
+        let mut app = TuiApp::new("api:test:editor".to_owned(), false);
+        let client = CentaurClient::new("http://127.0.0.1:1");
+        let key = ThreadKey::parse("api:test:editor").unwrap();
+        let options = TuiOptions {
+            debug_visible: false,
+            idle_timeout_ms: 1000,
+            max_duration_ms: 1234,
+            exit_on_terminal: false,
+            exit_on_output_type: None,
+            initial_state: None,
+        };
+        let (tx, _rx) = mpsc::channel(4);
+        for event in [
+            TerminalInput::Paste("a界🙂z".to_owned()),
+            TerminalInput::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            TerminalInput::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            TerminalInput::Paste("é\r\n".to_owned()),
+            TerminalInput::Key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
+        ] {
+            assert!(
+                !handle_terminal_event(&mut app, event, &client, &key, &options, tx.clone())
+                    .unwrap()
+            );
+        }
+        assert_eq!(app.input, "a界é\n");
+        for code in [
+            KeyCode::Home,
+            KeyCode::Char('X'),
+            KeyCode::End,
+            KeyCode::Char('Y'),
+        ] {
+            handle_terminal_event(
+                &mut app,
+                TerminalInput::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                &client,
+                &key,
+                &options,
+                tx.clone(),
+            )
+            .unwrap();
+        }
+        assert_eq!(app.input, "a界é\nXY");
+        handle_terminal_event(
+            &mut app,
+            TerminalInput::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &client,
+            &key,
+            &options,
+            tx.clone(),
+        )
+        .unwrap();
+        assert_eq!(app.history.last().unwrap(), "a界é\nXY");
+        assert!(app.input.is_empty());
+        app.recall_history(true);
+        handle_terminal_event(
+            &mut app,
+            TerminalInput::Key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE)),
+            &client,
+            &key,
+            &options,
+            tx,
+        )
+        .unwrap();
+        assert_eq!(app.input, "a界é\nXY!");
+        app.input_cursor = "a界".len();
+        let mut terminal = Terminal::new(TestBackend::new(10, 3)).unwrap();
+        terminal
+            .draw(|frame| draw_input(frame, Rect::new(0, 0, 10, 3), &app))
+            .unwrap();
+        assert_eq!(terminal.get_cursor_position().unwrap(), (4, 1).into());
+        assert!(screen_text(terminal.backend().buffer()).contains("a界"));
+        for (width, height) in [(24, 12), (10, 5), (1, 1), (0, 0)] {
+            screen(&mut app, width, height);
+        }
     }
 
     #[test]

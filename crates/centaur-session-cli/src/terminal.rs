@@ -7,7 +7,9 @@ use std::{
 
 use centaur_api_server::{
     client::{CentaurClient, ClientError},
-    types::{AppendMessagesRequest, CreateSessionRequest, ExecuteSessionRequest},
+    types::{
+        AppendMessagesRequest, CreateSessionRequest, ExecuteSessionRequest, ExecuteSessionResponse,
+    },
 };
 use centaur_session_core::{MessageRole, SessionMessageInput, ThreadKey};
 use clap::Subcommand;
@@ -24,20 +26,27 @@ use crate::{Args, HarnessTypeArg, tui, user_input_line};
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Inspect or change local configuration (environment values take precedence).
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Verify API client credentials; this does not verify session readiness.
     Login {
+        /// Read the client secret from stdin rather than a hidden terminal prompt.
         #[arg(long)]
         secret_stdin: bool,
     },
+    /// Remove saved local credentials only; does not revoke access or stop work.
+    Logout,
+    /// Create, inspect and control remote conversations.
     Chat {
         #[command(subcommand)]
         command: ChatCommand,
     },
-    /// Connect existing Console MCP integrations for new Codex sessions.
-    Mcp {
+    /// Connect external Console integrations used by remote agents (not MCP serving).
+    #[command(visible_alias = "mcp")]
+    Integrations {
         #[command(subcommand)]
         command: McpCommand,
     },
@@ -45,20 +54,29 @@ pub(crate) enum Command {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum McpCommand {
+    /// Deprecated: validate an existing integration URL and print consent; creates nothing.
     Add {
         name: String,
         #[arg(long)]
         url: String,
     },
+    /// List registered integrations and account/grant status, not connectivity.
     List,
     /// Print the personal browser-consent link; provider tokens stay in Console.
-    Login {
-        name: String,
-    },
+    #[command(name = "connect", visible_alias = "login")]
+    Login { name: String },
 }
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ConfigCommand {
+    /// Show resolved non-secret settings, sources and credential presence without networking.
+    Show,
+    /// Remove a saved setting; environment overrides remain active.
+    Unset {
+        #[arg(value_parser = ["endpoint", "client-id", "principal"])]
+        key: String,
+    },
+    /// Save a setting; changing endpoint/client invalidates the saved credential.
     Set {
         #[arg(value_parser = ["endpoint", "client-id", "principal"])]
         key: String,
@@ -68,6 +86,7 @@ pub(crate) enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ChatCommand {
+    /// Create or reuse a named conversation; attach unless --detach is supplied.
     New {
         #[arg(long)]
         name: Option<String>,
@@ -77,24 +96,42 @@ pub(crate) enum ChatCommand {
         persona: Option<String>,
         #[arg(long)]
         message: Option<String>,
+        /// Return without attaching; accepted work continues remotely.
         #[arg(long)]
         detach: bool,
-        #[arg(long, default_value_t = 3_600_000)]
+        /// Print one JSON execution receipt; requires --detach and --message.
+        #[arg(long, requires_all = ["detach", "message"])]
+        json: bool,
+        /// Deadline for each newly submitted turn, in milliseconds (not a session setting).
+        #[arg(long, default_value_t = 3_600_000, value_parser = clap::value_parser!(u64).range(1..))]
         max_duration_ms: u64,
     },
+    /// Reconnect to a conversation; Ctrl-D detaches, Ctrl-C interrupts remote work.
     Attach {
         name: String,
+        /// Deadline for subsequent turns from this attachment; does not alter running work.
+        #[arg(long, default_value_t = 3_600_000, value_parser = clap::value_parser!(u64).range(1..))]
+        max_duration_ms: u64,
     },
+    /// Enqueue a prompt and print its receipt; does not wait for completion.
     Send {
         name: String,
         message: String,
         /// Reuse this ID after an ambiguous network failure; never reuse for different text.
         #[arg(long)]
         request_id: Option<String>,
-        #[arg(long, default_value_t = 3_600_000)]
+        /// Print one JSON execution receipt; diagnostics stay on stderr.
+        #[arg(long)]
+        json: bool,
+        /// Deadline for this newly submitted turn, in milliseconds.
+        #[arg(long, default_value_t = 3_600_000, value_parser = clap::value_parser!(u64).range(1..))]
         max_duration_ms: u64,
     },
+    /// List conversations belonging to this API client.
     List {
+        /// Print one JSON object containing all listed items.
+        #[arg(long)]
+        json: bool,
         /// Include archived sessions.
         #[arg(long)]
         all: bool,
@@ -105,22 +142,21 @@ pub(crate) enum ChatCommand {
         yes: bool,
     },
     /// Hide an idle session from the default list; preserve history and files.
-    Archive {
-        name: String,
-    },
+    Archive { name: String },
     /// Make an archived session visible again.
-    Unarchive {
-        name: String,
-    },
+    Unarchive { name: String },
+    /// Show server session state and current/latest execution (not a completion wait).
     Status {
         name: String,
+        /// Print compact JSON; default is the same state as pretty JSON.
+        #[arg(long)]
+        json: bool,
     },
-    History {
-        name: String,
-    },
-    Interrupt {
-        name: String,
-    },
+    /// Print persisted messages, not a complete conversation; agent events are in logs.
+    History { name: String },
+    /// Request interruption of the session's active execution.
+    Interrupt { name: String },
+    /// Print retained raw events as JSONL; --follow keeps reading new events.
     Logs {
         name: String,
         #[arg(long, default_value_t = 0)]
@@ -157,8 +193,8 @@ fn load_config() -> Result<Value> {
     match fs::read(config_path()?) {
         Ok(bytes) => {
             use std::os::unix::fs::PermissionsExt;
-            let config: Value =
-                serde_json::from_slice(&bytes).wrap_err("parse Centaur configuration")?;
+            let config: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| eyre!("invalid Centaur configuration JSON"))?;
             if !config.is_object() {
                 bail!("Centaur configuration must be an object")
             }
@@ -320,9 +356,120 @@ fn read_secret(stdin: bool) -> Result<String> {
     result
 }
 
+fn forget_credential(config: &mut Value) {
+    for key in [
+        "client-secret",
+        "credential-endpoint",
+        "credential-client-id",
+    ] {
+        config
+            .as_object_mut()
+            .expect("validated configuration")
+            .remove(key);
+    }
+}
+
+fn show_config(config: &Value, args: &Args) -> Result<()> {
+    println!("config: {}", config_path()?.display());
+    for (key, variable) in [
+        ("endpoint", "CENTAUR_API_URL"),
+        ("client-id", "CENTAUR_CLIENT_ID"),
+        ("principal", ""),
+    ] {
+        let overridden = env::var(variable).ok().filter(|value| !value.is_empty());
+        let (value, source) = if key == "endpoint" && args.api_url.is_some() {
+            (
+                args.api_url.as_ref().map(|url| url.as_str().to_owned()),
+                args.api_url_source.unwrap_or("--api-url"),
+            )
+        } else if let Some(value) = overridden {
+            (Some(value), variable)
+        } else {
+            (config[key].as_str().map(str::to_owned), "config")
+        };
+        if key == "endpoint"
+            && let Some(value) = &value
+        {
+            endpoint(value)?; // Never display a URL containing embedded credentials.
+        }
+        match value {
+            Some(value) => println!("{key}: {value:?} (source: {source})"),
+            None => println!("{key}: not set"),
+        }
+    }
+    for (label, present) in [
+        ("saved client secret", config["client-secret"].is_string()),
+        (
+            "CENTAUR_CLIENT_SECRET",
+            env::var("CENTAUR_CLIENT_SECRET").is_ok_and(|v| !v.is_empty()),
+        ),
+        (
+            "bearer token (argument/environment)",
+            !args.api_token.is_empty(),
+        ),
+    ] {
+        println!("{label}: {}", if present { "present" } else { "absent" });
+    }
+    println!("Session readiness: unknown (configuration inspection makes no requests).");
+    Ok(())
+}
+
+fn creation_error(error: ClientError) -> eyre::Report {
+    if let ClientError::Api { status, body } = &error
+        && status.as_u16() == 400
+        && body.contains("principal is required: this API client has no default principal")
+    {
+        return eyre!(
+            "This API client has no usable default principal. In Console, attach an approved principal to this API client and select it as default, or use config set principal with an already attached identity. Personal integrations require your linked Console-user principal; do not reuse infrastructure identities."
+        );
+    }
+    error.into()
+}
+
+fn print_receipt(
+    execution: &ExecuteSessionResponse,
+    request_id: &str,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        let mut receipt = serde_json::to_value(execution)?;
+        receipt["request_id"] = json!(request_id);
+        println!("{}", receipt);
+    } else {
+        println!(
+            "Accepted: execution={} status={} request_id={} (not a completion result)",
+            execution.execution_id, execution.status, request_id
+        );
+    }
+    Ok(())
+}
+
 pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
     let mut config = load_config()?;
     match command {
+        Command::Config {
+            command: ConfigCommand::Show,
+        } => show_config(&config, args)?,
+        Command::Config {
+            command: ConfigCommand::Unset { key },
+        } => {
+            config
+                .as_object_mut()
+                .expect("validated configuration")
+                .remove(key);
+            if matches!(key.as_str(), "endpoint" | "client-id") {
+                forget_credential(&mut config);
+            }
+            save_config(&config)?;
+            println!("{key} removed from config; environment overrides remain active");
+        }
+        Command::Logout => {
+            forget_credential(&mut config);
+            save_config(&config)?;
+            println!(
+                "Saved local credential removed. Argument/environment credentials remain active; no server credential was revoked and no work was stopped."
+            );
+        }
         Command::Config {
             command: ConfigCommand::Set { key, value },
         } => {
@@ -333,10 +480,7 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
                 && matches!(key.as_str(), "endpoint" | "client-id")
             {
                 // Never forward a saved secret to a newly selected endpoint/client.
-                config
-                    .as_object_mut()
-                    .ok_or_else(|| eyre!("configuration must be an object"))?
-                    .remove("client-secret");
+                forget_credential(&mut config);
             }
             config[key] = json!(value);
             save_config(&config)?;
@@ -361,11 +505,11 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
             client.authenticate().await?;
             save_config(&config)?;
             println!(
-                "Authenticated; credential saved in {} (mode 0600)",
+                "Authenticated; credential saved in {} (mode 0600). Session readiness: unknown; an approved attached principal and session scopes are still required.",
                 config_path()?.display()
             );
         }
-        Command::Mcp { command } => {
+        Command::Integrations { command } => {
             use centaur_session_core::mcp::{McpServer, valid_mcp_name};
             // Validate before authenticating; the server also requires this URL
             // to match an existing operator-approved Console integration.
@@ -387,6 +531,9 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
             let (client, _) = client(&config, args)?;
             match command {
                 McpCommand::Add { .. } => {
+                    eprintln!(
+                        "Deprecated: mcp add does not register a server; use integrations connect <name> for existing Console integrations."
+                    );
                     let result = client
                         .connect_mcp_integration(
                             server
@@ -453,8 +600,12 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
                     persona,
                     message,
                     detach,
+                    json,
                     max_duration_ms,
                 } => {
+                    if message.as_ref().is_some_and(|text| text.trim().is_empty()) {
+                        bail!("prompt must not be empty")
+                    }
                     let name = name
                         .clone()
                         .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
@@ -470,21 +621,27 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
                                 principal: config["principal"].as_str().map(str::to_owned),
                             },
                         )
-                        .await?;
+                        .await
+                        .map_err(creation_error)?;
                     eprintln!("session={name} thread_key={key} (create or reuse)");
                     if let Some(text) = message {
                         let request = Uuid::new_v4().to_string();
                         eprintln!(
                             "request_id={request} (reuse with chat send to retry this exact prompt)"
                         );
-                        send_message(&client, &key, text, &request, *max_duration_ms).await?;
+                        let execution =
+                            send_message(&client, &key, text, &request, *max_duration_ms).await?;
+                        print_receipt(&execution, &request, *json)?;
                     }
                     if !detach {
                         attach(client, key, *max_duration_ms).await?;
                     }
                 }
-                ChatCommand::List { all } => {
-                    println!("NAME\tHARNESS\tSTATUS\tLAST ACTIVITY");
+                ChatCommand::List { all, json } => {
+                    let mut items = Vec::new();
+                    if !json {
+                        println!("NAME\tHARNESS\tSTATUS\tLAST ACTIVITY");
+                    }
                     let prefix = format!("api:{id}:");
                     let mut after = String::new();
                     loop {
@@ -493,6 +650,10 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
                             .as_array()
                             .ok_or_else(|| eyre!("invalid session list response"))?
                         {
+                            if *json {
+                                items.push(item.clone());
+                                continue;
+                            }
                             let key = item["thread_key"].as_str().unwrap_or("");
                             println!(
                                 "{}\t{}\t{}\t{}",
@@ -513,6 +674,9 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
                             bail!("session list cursor did not advance")
                         }
                         after = next.to_owned();
+                    }
+                    if *json {
+                        println!("{}", json!({"items": items}));
                     }
                 }
                 ChatCommand::Prune { yes } => {
@@ -591,20 +755,27 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
                         bail!("prune finished with {failed} failure(s); inspect before retrying")
                     }
                 }
-                ChatCommand::Attach { name } => {
-                    attach(client, thread_key(&id, name)?, 3_600_000).await?
+                ChatCommand::Attach {
+                    name,
+                    max_duration_ms,
+                } => {
+                    if *max_duration_ms == 0 {
+                        bail!("max duration must be positive")
+                    }
+                    attach(client, thread_key(&id, name)?, *max_duration_ms).await?
                 }
                 ChatCommand::Send {
                     name,
                     message,
                     request_id,
+                    json,
                     max_duration_ms,
                 } => {
                     let request = request_id
                         .clone()
                         .unwrap_or_else(|| Uuid::new_v4().to_string());
                     eprintln!("request_id={request} (reuse to retry this exact prompt)");
-                    send_message(
+                    let execution = send_message(
                         &client,
                         &thread_key(&id, name)?,
                         message,
@@ -612,13 +783,19 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
                         *max_duration_ms,
                     )
                     .await?;
+                    print_receipt(&execution, &request, *json)?;
                 }
-                ChatCommand::Status { name } => println!(
-                    "{}",
-                    serde_json::to_string_pretty(
-                        &client.session_state(&thread_key(&id, name)?).await?
-                    )?
-                ),
+                ChatCommand::Status { name, json } => {
+                    let state = client.session_state(&thread_key(&id, name)?).await?;
+                    println!(
+                        "{}",
+                        if *json {
+                            serde_json::to_string(&state)?
+                        } else {
+                            serde_json::to_string_pretty(&state)?
+                        }
+                    );
+                }
                 ChatCommand::History { name } => {
                     let state = client.session_state(&thread_key(&id, name)?).await?;
                     for line in prompt_history(&state) {
@@ -738,7 +915,7 @@ pub(crate) async fn send_message(
     text: &str,
     request_id: &str,
     max_duration_ms: u64,
-) -> Result<()> {
+) -> Result<ExecuteSessionResponse> {
     if text.trim().is_empty() || request_id.trim().is_empty() || max_duration_ms == 0 {
         bail!("prompt and request ID must not be empty, and max duration must be positive")
     }
@@ -756,7 +933,7 @@ pub(crate) async fn send_message(
         )
         .await
         .wrap_err("append prompt (retry using the same request ID)")?;
-    let _execution = client
+    client
         .execute_session(
             key,
             ExecuteSessionRequest {
@@ -768,8 +945,7 @@ pub(crate) async fn send_message(
             },
         )
         .await
-        .wrap_err("enqueue execution (prompt is persisted; retry using the same request ID)")?;
-    Ok(())
+        .wrap_err("enqueue execution (prompt is persisted; retry using the same request ID)")
 }
 
 #[cfg(test)]

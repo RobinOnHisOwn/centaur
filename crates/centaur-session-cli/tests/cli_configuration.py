@@ -7,10 +7,14 @@ import http.server
 import json
 import os
 import pathlib
+import pty
+import select
 import shutil
 import subprocess
 import tempfile
 import threading
+import time
+import termios
 import unittest
 import urllib.parse
 
@@ -23,6 +27,10 @@ class TokenServer(http.server.BaseHTTPRequestHandler):
     prune_error = 0
     prune_page_error = False
     mcp_items = []
+    execute_error = False
+    create_ok = False
+    list_pages = False
+    list_page_error = False
 
     def lifecycle_response(self, value):
         assert self.headers['Authorization'] == 'Bearer fixture-access-token'
@@ -56,6 +64,19 @@ class TokenServer(http.server.BaseHTTPRequestHandler):
             self.lifecycle_response({'items': type(self).mcp_items})
             return
         type(self).lifecycle.append(('GET', self.path))
+        if '/events?' in self.path:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.end_headers()
+            self.wfile.write(b'id: 1\nevent: session.execution_completed\ndata: {}\n\n')
+            self.wfile.flush()
+            self.stream_stop.wait(15)
+            return
+        if self.path.endswith('/state'):
+            self.lifecycle_response({'session': {'thread_key': 'api:acl_test:old'},
+                                     'execution': {'execution_id': 'exe_fixture', 'status': 'queued'},
+                                     'messages': [], 'last_event_id': 0})
+            return
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
         if query.get('prunable_only') == ['true']:
             second = bool(query.get('after_thread_key', [''])[0])
@@ -71,9 +92,43 @@ class TokenServer(http.server.BaseHTTPRequestHandler):
                 value['prune_older_than_days'] = 30
             self.lifecycle_response(value)
             return
+        if self.list_pages:
+            second = bool(query.get('after_thread_key'))
+            if second and self.list_page_error:
+                self.send_response(503)
+                self.end_headers()
+                return
+            name = 'old2' if second else 'old'
+            self.lifecycle_response({'items': [{'thread_key': f'api:acl_test:{name}'}],
+                                     'next_after_thread_key': None if second else 'api:acl_test:old'})
+            return
         self.lifecycle_response({'items': [], 'next_after_thread_key': None})
 
     def do_POST(self):
+        path = urllib.parse.unquote(self.path)
+        if path.startswith('/api/session/') and not path.endswith('/archive'):
+            body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            type(self).lifecycle.append(('POST', path, body))
+            if path.endswith('/messages'):
+                self.lifecycle_response({'ok': True, 'message_ids': ['msg_fixture']})
+            elif path.endswith('/execute'):
+                if self.execute_error:
+                    self.send_response(503)
+                    self.end_headers()
+                    self.wfile.write(b'enqueue unavailable')
+                else:
+                    self.lifecycle_response({'ok': True, 'execution_id': 'exe_fixture',
+                                             'thread_key': 'api:acl_test:old', 'status': 'queued'})
+            elif self.create_ok:
+                self.lifecycle_response({'thread_key': path.removeprefix('/api/session/'),
+                                         'harness_type': body['harness_type'], 'status': 'idle',
+                                         'created_at': [2026, 324, 0, 0, 0, 0, 0, 0, 0],
+                                         'updated_at': [2026, 324, 0, 0, 0, 0, 0, 0, 0]})
+            else:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b'{"error":"principal is required: this API client has no default principal","ok":false}')
+            return
         if self.path.startswith('/api/mcp/servers'):
             body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             if self.path == '/api/mcp/servers':
@@ -124,6 +179,12 @@ class Configuration(unittest.TestCase):
         TokenServer.prune_error = 0
         TokenServer.prune_page_error = False
         TokenServer.mcp_items = []
+        TokenServer.execute_error = False
+        TokenServer.create_ok = False
+        TokenServer.list_pages = False
+        TokenServer.list_page_error = False
+        TokenServer.stream_stop = threading.Event()
+        self.addCleanup(TokenServer.stream_stop.set)
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), TokenServer)
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
@@ -142,6 +203,192 @@ class Configuration(unittest.TestCase):
         self.assertNotIn("fixture-secret", result.stdout + result.stderr)
         self.assertNotIn("fixture-access-token", result.stdout + result.stderr)
         return result
+
+    def test_legacy_flags_cannot_be_silently_ignored_by_subcommands(self):
+        self.run_cli('login', '--secret-stdin', input='fixture-secret\n')
+        for flags in [
+            ['--harness-type', 'pi'], ['--message', 'hello'], ['--thread-key', 'cli:test'],
+            ['--attach'], ['--input-line', '{}'], ['--idle-timeout-ms', '1000'],
+            ['--max-duration-ms', '60000'], ['--after-event-id', '0'], ['--all-events'],
+            ['--exit-on-terminal'], ['--exit-on-output-type', 'done'], ['--stdin-events'],
+            ['--tui'], ['--debug'],
+        ]:
+            with self.subTest(flags=flags):
+                before = TokenServer.requests
+                result = self.run_cli(*flags, 'chat', 'list', ok=False)
+                self.assertIn('legacy', result.stderr.lower())
+                self.assertEqual(TokenServer.requests, before)
+                self.assertEqual(TokenServer.lifecycle, [])
+        self.run_cli('--api-url', self.endpoint, 'chat', 'list')
+
+    def test_legacy_execution_flags_still_select_the_harness_and_duration(self):
+        TokenServer.create_ok = True
+        self.env['CENTAUR_API_TOKEN'] = 'fixture-access-token'
+        self.run_cli('--api-url', self.endpoint, '--thread-key', 'api:acl_test:legacy',
+                     '--harness-type', 'pi', '--message', 'legacy prompt',
+                     '--max-duration-ms', '3210', '--exit-on-terminal')
+        posts = [row for row in TokenServer.lifecycle if row[0] == 'POST']
+        self.assertEqual(posts[0][2]['harness_type'], 'pi')
+        self.assertEqual(posts[1][2]['messages'][0]['parts'][0]['text'], 'legacy prompt')
+        self.assertEqual(posts[2][2]['max_duration_ms'], 3210)
+
+    def test_config_inspection_unset_and_local_logout(self):
+        self.run_cli('login', '--secret-stdin', input='fixture-secret\n')
+        self.run_cli('config', 'set', 'principal', 'prn_example')
+        shown = self.run_cli('config', 'show').stdout
+        self.assertIn(self.endpoint, shown)
+        self.assertIn('prn_example', shown)
+        self.assertIn('present', shown)
+        self.env['CENTAUR_CLIENT_ID'] = 'acl_override'
+        self.assertIn('CENTAUR_CLIENT_ID', self.run_cli('config', 'show').stdout)
+        del self.env['CENTAUR_CLIENT_ID']
+        self.run_cli('config', 'unset', 'principal')
+        self.assertNotIn('principal', json.loads(self.config.read_text()))
+        self.run_cli('logout')
+        saved = json.loads(self.config.read_text())
+        self.assertEqual(saved['endpoint'], self.endpoint)
+        self.assertFalse(set(saved) & {'client-secret', 'credential-endpoint', 'credential-client-id'})
+        self.run_cli('logout')
+        self.env['CENTAUR_CLIENT_SECRET'] = 'fixture-secret'
+        self.assertIn('environment', self.run_cli('logout').stdout.lower())
+        self.run_cli('chat', 'list')  # logout must not claim to revoke environment credentials
+        self.run_cli('config', 'unset', 'endpoint')
+        self.assertNotIn('endpoint', json.loads(self.config.read_text()))
+
+    def test_config_show_rejects_insecure_or_malformed_secret_files_without_leaking(self):
+        self.run_cli('login', '--secret-stdin', input='fixture-secret\n')
+        self.config.chmod(0o644)
+        self.assertIn('0600', self.run_cli('config', 'show', ok=False).stderr)
+        self.config.chmod(0o600)
+        self.config.write_text('{"client-secret": fixture-secret}')
+        self.run_cli('config', 'show', ok=False)
+
+    def test_readiness_is_not_implied_by_login_or_listing(self):
+        result = self.run_cli('login', '--secret-stdin', input='fixture-secret\n')
+        self.assertIn('readiness', result.stdout.lower())
+        self.assertEqual(TokenServer.lifecycle, [])
+        result = self.run_cli('chat', 'new', '--name', 'test', '--detach', ok=False)
+        self.assertIn('Console', result.stderr)
+        self.assertIn('default principal', result.stderr)
+
+    def test_integration_aliases_reuse_console_and_warn_about_add(self):
+        self.run_cli('login', '--secret-stdin', input='fixture-secret\n')
+        self.assertEqual(self.run_cli('integrations', 'list').stdout,
+                         self.run_cli('mcp', 'list').stdout)
+        self.assertEqual(self.run_cli('integrations', 'connect', 'docs').stdout,
+                         self.run_cli('mcp', 'login', 'docs').stdout)
+        result = self.run_cli('mcp', 'add', 'docs', '--url', 'https://mcp.example.com/mcp')
+        self.assertIn('deprecated', result.stderr.lower())
+
+    def test_attached_tui_sends_edited_unicode_with_selected_timeout_and_detaches(self):
+        self.run_cli('login', '--secret-stdin', input='fixture-secret\n')
+        master, slave = pty.openpty()
+        termios.tcsetwinsize(slave, (24, 100))
+        process = subprocess.Popen(
+            [self.binary, 'chat', 'attach', 'old', '--max-duration-ms', '1234'],
+            env={**self.env, 'TERM': 'xterm-256color'},
+            pass_fds=(slave,), preexec_fn=lambda: os.login_tty(slave),
+        )
+        os.close(slave)
+        output = bytearray()
+        cursor_reports = 0
+
+        def wait_for(predicate):
+            nonlocal cursor_reports
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if predicate():
+                    return
+                if select.select([master], [], [], 0.05)[0]:
+                    try:
+                        output.extend(os.read(master, 65536))
+                        # A PTY is not a terminal emulator: answer Crossterm's DSR query.
+                        reports = output.count(b'\x1b[6n')
+                        if reports > cursor_reports:
+                            os.write(master, b'\x1b[1;1R' * (reports - cursor_reports))
+                            cursor_reports = reports
+                    except OSError:
+                        break
+            self.fail('TUI condition not reached: ' + output.decode(errors='replace')[-2000:])
+
+        try:
+            wait_for(lambda: b'CENTAUR' in output)
+            # Edit in the middle of multibyte text, then submit exactly what is displayed.
+            os.write(master, 'a界🙂z'.encode() + b'\x1b[D\x7f' + 'é'.encode() + b'\x1b[3~\r')
+            wait_for(lambda: any(row[0] == 'POST' and row[1].endswith('/execute') for row in TokenServer.lifecycle))
+            posts = [row for row in TokenServer.lifecycle if row[0] == 'POST']
+            self.assertEqual(posts[0][2]['messages'][0]['parts'][0]['text'], 'a界é')
+            self.assertEqual(posts[1][2]['max_duration_ms'], 1234)
+            # Force a full frame: differential rendering may omit unchanged letters
+            # within the receipt, so raw PTY bytes are not a contiguous screen string.
+            termios.tcsetwinsize(master, (24, 120))
+            wait_for(lambda: b'exe_fixture' in output)
+            os.write(master, b'\x04')
+            self.assertEqual(process.wait(timeout=10), 0)
+            self.assertEqual(len([row for row in TokenServer.lifecycle if row[0] == 'POST']), 2,
+                             'detaching must not submit an interrupt or another turn')
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            os.close(master)
+            TokenServer.stream_stop.set()
+
+    def test_json_new_receipt_and_list_pagination(self):
+        self.run_cli('login', '--secret-stdin', input='fixture-secret\n')
+        TokenServer.create_ok = True
+        result = self.run_cli('chat', 'new', '--name', 'old', '--harness', 'pi',
+                              '--message', 'hello', '--detach', '--json')
+        self.assertEqual(json.loads(result.stdout)['execution_id'], 'exe_fixture')
+        self.assertEqual(TokenServer.lifecycle[0][2]['harness_type'], 'pi')
+        self.assertEqual(len(TokenServer.lifecycle), 3)
+        TokenServer.list_pages = True
+        result = self.run_cli('chat', 'list', '--json')
+        self.assertEqual([item['thread_key'] for item in json.loads(result.stdout)['items']],
+                         ['api:acl_test:old', 'api:acl_test:old2'])
+        TokenServer.list_page_error = True
+        result = self.run_cli('chat', 'list', '--json', ok=False)
+        self.assertEqual(result.stdout, '', 'do not print partial JSON on pagination failure')
+
+    def test_invalid_new_inputs_do_not_create_sessions(self):
+        self.run_cli('login', '--secret-stdin', input='fixture-secret\n')
+        TokenServer.create_ok = True
+        for options in [['--message', '  '], ['--max-duration-ms', '0']]:
+            with self.subTest(options=options):
+                TokenServer.lifecycle = []
+                self.run_cli('chat', 'new', '--name', 'old', '--detach', *options, ok=False)
+                self.assertEqual(TokenServer.lifecycle, [])
+
+    def test_send_exposes_execution_receipt_and_preserves_request(self):
+        self.run_cli('login', '--secret-stdin', input='fixture-secret\n')
+        result = self.run_cli('chat', 'send', 'old', 'hello', '--request-id', 'retry-1',
+                              '--max-duration-ms', '1234', '--json')
+        self.assertEqual(json.loads(result.stdout), {
+            'ok': True, 'execution_id': 'exe_fixture', 'thread_key': 'api:acl_test:old',
+            'status': 'queued', 'request_id': 'retry-1'})
+        self.assertIn('retry-1', result.stderr)
+        append, execute = TokenServer.lifecycle
+        self.assertEqual(append[2]['messages'][0]['client_message_id'], 'retry-1')
+        self.assertEqual(execute[2]['idempotency_key'], 'retry-1')
+        self.assertEqual(execute[2]['max_duration_ms'], 1234)
+        result = self.run_cli('chat', 'send', 'old', 'hello')
+        self.assertIn('exe_fixture', result.stdout)
+        self.assertIn('queued', result.stdout)
+        TokenServer.execute_error = True
+        result = self.run_cli('chat', 'send', 'old', 'hello', '--json', ok=False)
+        self.assertEqual(result.stdout, '')
+        self.assertIn('prompt is persisted', result.stderr)
+
+    def test_json_reads_and_attach_timeout_help(self):
+        self.run_cli('login', '--secret-stdin', input='fixture-secret\n')
+        self.assertEqual(json.loads(self.run_cli('chat', 'list', '--json').stdout), {'items': []})
+        status = json.loads(self.run_cli('chat', 'status', 'old', '--json').stdout)
+        self.assertEqual(status['execution']['execution_id'], 'exe_fixture')
+        self.assertIn('--max-duration-ms', self.run_cli('chat', 'attach', '--help').stdout)
+        self.assertIn('reuse', self.run_cli('chat', 'new', '--help').stdout)
+        self.assertIn('enqueue', self.run_cli('chat', 'send', '--help').stdout.lower())
+        self.assertIn('not a complete', self.run_cli('chat', 'history', '--help').stdout.lower())
+        self.run_cli('chat', 'new', '--json', ok=False)  # JSON must not start a TUI
 
     @unittest.skipUnless(shutil.which("strace"), "requires strace")
     def test_atomic_config_replacement_uses_destination_directory(self):

@@ -54,14 +54,40 @@ A secret manager can pipe the secret to `centaur login --secret-stdin`, or injec
 
 Access tokens stay in memory. The client reacquires expiring tokens using the saved client secret, retries a rejected token once, and resumes SSE with the last event ID. Revoked credentials/scopes fail visibly instead of retrying forever. This is machine-client login, not a browser/user OAuth flow. Legacy `CENTAUR_API_TOKEN` is still accepted, but cannot be renewed; session discovery requires an API-client identity.
 
-Optional `centaur config set principal <attached-principal>` selects another attached principal for new sessions. It does not alter an existing session's principal.
+Optional `centaur config set principal <attached-principal>` selects another attached principal for new sessions. It does not alter an existing session's principal. `centaur config unset principal` restores default selection for new sessions.
 
-## Personal MCP connections (requires matching Console and API versions)
+Login verifies authentication only, not permission to create a session. The administrator must attach an approved principal to the API client and select a default (or supply an already attached principal explicitly). Personal integrations additionally require a Console-user principal linked to the client's creator; creating an arbitrary principal with your name is not equivalent. Do not borrow infrastructure identities or copy their grants. The CLI does not create principals or grant permissions.
+
+### Inspect and undo local setup
+
+```bash
+centaur config show
+centaur config unset principal
+centaur logout
+```
+
+`config show` prints only allowed non-secret settings, their sources and credential presence; it makes no network requests. Endpoint precedence is `--api-url`, then `CENTAUR_API_URL`, then saved config. `CENTAUR_CLIENT_ID` and `CENTAUR_CLIENT_SECRET` override their saved values. `CENTAUR_API_TOKEN` selects legacy bearer authentication. Principal selection comes from saved config, not an environment variable.
+
+`config unset endpoint` and `config unset client-id` also invalidate the saved credential. `logout` removes the saved secret and its endpoint/client binding, but keeps other settings. It does **not** revoke credentials on the server, stop work, or remove credentials injected through arguments/environment. No browser SSO or automatic principal provisioning is performed.
+
+Use separate `CENTAUR_CONFIG` files for separate installations rather than repeatedly replacing credentials:
+
+```bash
+CENTAUR_CONFIG="$HOME/.config/centaur/alternate.json" centaur config show
+```
+
+### Legacy invocation compatibility
+
+The original root execution flags still work when no subcommand is used. Mixing them with `chat`, `config`, `login`, or `integrations` now fails rather than silently ignoring them. For example, use `centaur chat new --harness pi`, **not** `centaur --harness-type pi chat new`. Connection flags remain usable before subcommands. The old root execution defaults remain unchanged; modern chat commands use their documented defaults.
+
+## External integrations (requires matching Console and API versions)
 
 The source of truth is **Console → Integrations**, not a local or session-database registry. An operator must enable a non-shared custom OAuth app (or Granola) with the label `mcp=true` (string value). Use a credential-free HTTPS resource URL and configure Console's public HTTPS origin. Expose the scoped `/api/mcp/servers` routes to CLI users, not the Console operator API.
 
-- `centaur mcp list` shows registered apps, account status and whether the personal principal has a grant. These are not connectivity checks.
-- `centaur mcp login docs` prints Console's consent link. Alternatively, `centaur mcp add docs --url https://mcp.example.com/mcp` checks an existing registration and prints the link; it does not register a new endpoint. Complete consent in a browser with your own Console account.
+- `centaur integrations list` shows registered apps, account status and whether the personal principal has a grant. These are not connectivity checks.
+- `centaur integrations connect docs` prints Console's consent link. Complete consent in a browser with your own Console account; the command does not confirm completion.
+- `centaur mcp list/login` remain compatibility aliases. `centaur mcp add docs --url https://mcp.example.com/mcp` is deprecated: it only validates an existing registration and prints consent; it does not register a new endpoint.
+- These commands configure external integrations **used by** remote agents, not an MCP server for controlling Centaur. This CLI does not yet provide the planned `mcp serve` session adapter.
 - New Codex sessions snapshot eligible endpoints; existing sessions retain their endpoint list. An API client needs a matching personal default principal. No new token store, implicit grant, local provider login, or database migration is needed.
 - Disconnect only through the signed-in Console. This removes **all** of your saved accounts for that integration and their wrapper grants, not just a CLI setting. It does not revoke tokens at the provider. There is no preference-only disable command.
 - The provider or MCP server enforces allowed operations. A proxy grant does not imply read-only access. Verify the actual Codex/proxy path, overlapping credential rules, refresh ownership and revocation before rollout.
@@ -77,7 +103,7 @@ centaur chat new --name dbt-refactor
 
 The UI uses Pi-inspired Catppuccin Mocha colors, shaded user/tool panels, Markdown replies and a compact editor with purple horizontal borders. A persistent **CENTAUR** header identifies the remote session and harness. Provider failures appear inline in red; **F2** still exposes raw events. Markdown uses the pinned `tui-markdown` Ratatui adapter without its optional syntax-highlighting bundle.
 
-In the UI: **Enter** sends; **Alt-Enter** adds a newline; bracketed paste preserves multiline text; **Up/Down** recalls prompts, including persisted prompts after attachment; **PageUp/PageDown** scrolls the wrapped transcript; **F2** shows raw events. The lightweight editor supports append/backspace, not Pi's complete local editor.
+In the UI: **Enter** sends; **Alt-Enter** adds a newline; bracketed paste preserves multiline text; **Up/Down** recalls prompts, including persisted prompts after attachment; **PageUp/PageDown** scrolls the wrapped transcript; **F2** shows raw events. **Left/Right** move the insertion cursor, **Home/End** move to the current line boundaries, and **Backspace/Delete** remove adjacent Unicode scalar values. Paste inserts at the cursor. This is a small UTF-8-safe editor, not Pi's full editor or a grapheme-aware text editor.
 
 **Ctrl-C** or `/interrupt` explicitly interrupts remote execution. **Ctrl-D**, `/quit`, terminal close or client crash only detach; they do not send cancellation. Until submission is acknowledged, a network failure is ambiguous—check status/history before resubmitting. Do not detach while the UI still says “sending message”.
 
@@ -119,9 +145,24 @@ centaur chat interrupt dbt-refactor
 
 Names contain 1–64 ASCII letters, digits, hyphens or underscores. They map directly to `api:<client-id>:<name>`, with no local registry. `new` follows Centaur's create-or-reuse semantics; reusing a name/harness reuses that conversation. Omit `--name` for a new UUID name. `--persona` uses the existing persona mechanism; a persona may pin a different harness/model.
 
-`status` includes actionable execution errors. `list` reports queued/running/completed/failed/cancelled, or idle if no execution exists. Commands do not hold tasks open: `chat send` and `new --detach --message` exit after durable enqueue. Tasks default to a one-hour server execution deadline; pass `--max-duration-ms` on `new`/`send` to change it. No per-turn idle-pause timer is requested by normal chat messages; global server cleanup/capacity policy still applies.
+`status` includes actionable execution errors. `list` reports queued/running/completed/failed/cancelled, or idle if no execution exists. Commands do not hold tasks open: `chat send` and `new --detach --message` exit after durable enqueue. Tasks default to a one-hour server execution deadline; pass a positive `--max-duration-ms` on `new`/`send` to change it. `attach --max-duration-ms` sets the deadline for subsequent turns submitted from that attachment, not an existing execution or persistent session setting. No per-turn idle-pause timer is requested by normal chat messages; global server cleanup/capacity policy still applies.
 
 For scripted multiline prompts, pass one quoted argument to `chat send`. It prints a request ID before submission. Reuse that exact ID and prompt with `--request-id` after an ambiguous failure; message append and execution are separate durable operations, not one transaction. They use matching deduplication/idempotency keys. Do not reuse an ID for different text. Ordinary POST transport failures are not blindly retried. Existing Centaur behavior may steer a message appended during an active execution; avoid simultaneous writers to the **same** session. Independent sessions can execute concurrently.
+
+### Submission receipts and JSON output
+
+A successful `send` or `new --message` reports the server's execution ID, status and request ID. This is an acceptance receipt, **not** the final answer. The TUI also displays these identifiers after submission. A request ID is printed on stderr before submission so ambiguous failures can be retried safely.
+
+```bash
+centaur chat send dbt-refactor 'Summarize the changes' --json
+centaur chat new --name analysis --message 'Inspect the repository' --detach --json
+centaur chat list --json
+centaur chat status dbt-refactor --json
+```
+
+Receipt JSON has `ok`, `execution_id`, `thread_key`, `status`, and `request_id`. `new --json` requires both `--detach` and `--message`, preventing terminal UI output from corrupting JSON. `list --json` returns one object with an `items` array aggregated across pages; errors do not emit a partial result. `status --json` returns compact server state (the default remains pretty JSON). Diagnostics remain on stderr and failures return a nonzero exit code. `logs` remains JSONL.
+
+`history` prints persisted messages, not a complete chronological transcript. Inspect retained agent events with `logs`. Existing client-scoped sessions and the separate append/enqueue protocol remain unchanged; this release does not enable shared CLI/MCP sessions, atomic submission or execution-targeted interruption.
 
 ## Lifecycle boundaries
 
