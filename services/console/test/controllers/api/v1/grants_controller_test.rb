@@ -176,6 +176,46 @@ module Api
         assert_nil data["principal_id"]
       end
 
+      test "POST rejects multiple grantees before changing grants" do
+        body = { data: {
+          principal_id: principals(:globex_user).oid,
+          role_id: roles(:acme_admin_role).oid,
+          static_secret_id: static_secrets(:github_token_inject).oid
+        } }
+
+        assert_no_difference -> { Grant.count } do
+          post api_v1_grants_url, params: body.to_json, headers: auth_headers
+        end
+        assert_response :unprocessable_entity
+      end
+
+      test "POST rejects multiple secret references before resolving records" do
+        body = { data: {
+          principal_id: "prn_missing",
+          static_secret_id: static_secrets(:github_token_inject).oid,
+          hmac_secret_id: hmac_secrets(:acme_webhook_hmac).oid
+        } }
+
+        assert_no_difference -> { Grant.count } do
+          post api_v1_grants_url, params: body.to_json, headers: auth_headers
+        end
+        assert_response :unprocessable_entity
+      end
+
+      test "Console session grants reject ambiguous selectors too" do
+        sign_in_console(users(:acme_admin))
+        body = { data: {
+          principal_id: principals(:globex_user).oid,
+          role_id: roles(:acme_admin_role).oid,
+          static_secret_id: static_secrets(:github_token_inject).oid
+        } }
+
+        assert_no_difference -> { Grant.count } do
+          post api_v1_console_grants_path, params: body, headers: csrf_headers, as: :json
+        end
+        assert_response :unprocessable_entity
+      end
+
       test "POST returns 422 when no grantee id is supplied" do
         body = { data: { static_secret_id: static_secrets(:github_token_inject).oid } }
 

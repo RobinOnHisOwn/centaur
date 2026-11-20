@@ -15,6 +15,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
+mod admin;
 mod terminal;
 mod tui;
 
@@ -78,7 +79,7 @@ pub(crate) type SseFrame = ApiSseEvent;
 
 #[derive(Debug, Parser)]
 #[command(
-    about = "Control remote Centaur chats; agents and tools run on the server",
+    about = "Control remote Centaur chats and administer Console; agents and tools run on the server",
     after_help = "Start: config set endpoint <HTTPS-URL>, config set client-id <ID>, login, chat new.\nLegacy execution flags are for invocations without a subcommand.\nUse chat new --harness / --message / --max-duration-ms instead of root flags."
 )]
 struct Args {
@@ -201,6 +202,16 @@ async fn main() -> Result<()> {
                 Args::command().error(
                     clap::error::ErrorKind::ArgumentConflict,
                     format!("legacy execution option {id} cannot be combined with a subcommand; use the subcommand's --help (chat new uses --harness, --message and --max-duration-ms)"),
+                ).exit();
+            }
+        }
+    }
+    if matches.subcommand_name() == Some("admin") {
+        for id in ["api_url", "api_token"] {
+            if matches.value_source(id) == Some(ValueSource::CommandLine) {
+                Args::command().error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "admin uses its separate endpoint/key: admin config set endpoint, CENTAUR_ADMIN_URL and CENTAUR_ADMIN_API_KEY; root connection flags are chat-only",
                 ).exit();
             }
         }

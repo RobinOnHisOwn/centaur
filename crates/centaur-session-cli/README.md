@@ -1,6 +1,6 @@
-# Centaur terminal sessions
+# Centaur terminal CLI
 
-A thin extension of Centaur's existing Rust session CLI. Pi, tools and repositories run **remotely**; this executable only calls the session API and renders events. No local Kubernetes access, SSH, tmux, session database or agent subprocess is involved.
+A thin HTTP client for remote chats and explicit Console administration. Pi, tools and repositories run **remotely**. Chat commands use api-rs; `admin` uses Console's separate operator API and credentials. No local Kubernetes access, SSH, tmux, session database or agent subprocess is involved.
 
 ## Server prerequisites
 
@@ -56,7 +56,7 @@ Access tokens stay in memory. The client reacquires expiring tokens using the sa
 
 Optional `centaur config set principal <attached-principal>` selects another attached principal for new sessions. It does not alter an existing session's principal. `centaur config unset principal` restores default selection for new sessions.
 
-Login verifies authentication only, not permission to create a session. The administrator must attach an approved principal to the API client and select a default (or supply an already attached principal explicitly). Personal integrations additionally require a Console-user principal linked to the client's creator; creating an arbitrary principal with your name is not equivalent. Do not borrow infrastructure identities or copy their grants. The CLI does not create principals or grant permissions.
+Login verifies authentication only, not permission to create a session. The administrator must attach an approved principal to the API client and select a default (or supply an already attached principal explicitly). Personal integrations additionally require a Console-user principal linked to the client's creator; creating an arbitrary principal with your name is not equivalent. Do not borrow infrastructure identities or copy their grants. Chat login never creates principals or grants permissions. Explicit operator operations are available separately under [`admin`](#console-administration).
 
 ### Inspect and undo local setup
 
@@ -78,7 +78,71 @@ CENTAUR_CONFIG="$HOME/.config/centaur/alternate.json" centaur config show
 
 ### Legacy invocation compatibility
 
-The original root execution flags still work when no subcommand is used. Mixing them with `chat`, `config`, `login`, or `integrations` now fails rather than silently ignoring them. For example, use `centaur chat new --harness pi`, **not** `centaur --harness-type pi chat new`. Connection flags remain usable before subcommands. The old root execution defaults remain unchanged; modern chat commands use their documented defaults.
+The original root execution flags still work when no subcommand is used. Mixing them with `chat`, `config`, `login`, or `integrations` now fails rather than silently ignoring them. For example, use `centaur chat new --harness pi`, **not** `centaur --harness-type pi chat new`. Chat connection flags remain usable before chat/config/login/integrations subcommands. Explicit root `--api-url`/`--api-token` flags are rejected with `admin`, which has separate settings. The old root execution defaults remain unchanged; modern chat commands use their documented defaults.
+
+## Console administration
+
+Use `centaur admin` only with an authorized Console **operator API key**, whose owner must remain an active administrator. This is not a chat API-client secret, Keycloak token, sandbox token or Console browser cookie. The Console operator endpoint must be reachable through your deployment's existing administrative access policy; these commands do not expose it publicly or change ingress.
+
+```bash
+centaur admin config set endpoint https://console.example.com
+centaur admin login
+centaur admin status --json
+centaur admin config show
+```
+
+Login prompts without echo. A secret manager can instead pipe the key to `centaur admin login --key-stdin`; never pass it in arguments. It verifies `GET /api/v1/roles?limit=1&page=1` before saving the key in the existing mode-0600 config, bound to that exact admin endpoint. This proves current operator authorization, not session readiness or least privilege. Config and logout commands do not revoke server credentials.
+
+For automation, inject `CENTAUR_ADMIN_URL` and `CENTAUR_ADMIN_API_KEY` from a secret manager. These override saved admin settings; there is no chat-endpoint or chat-token fallback. Environment-only use does not save a key unless `admin login` is explicitly run. Admin logout removes only the saved admin key/binding; root logout remains chat-only. Both preserve the other credential type. `admin config unset endpoint` removes the saved admin endpoint and bound key; changing it invalidates the saved key. Environment overrides remain active.
+
+### Available commands
+
+All entries below are relative to `centaur admin`; append `--json` for one machine-readable JSON object (diagnostics remain on stderr). The human default is pretty JSON.
+
+| Group | Operations |
+| --- | --- |
+| `principals` | `list`, `get <ref>`, `create`, `update <ref>`, `upsert <foreign-id>`, `effective-config <ref>` |
+| `principals roles` | `list <principal-ref>`, `add <principal-ref> <role-ref>`, `remove <principal-ref> <role-ref> --yes` |
+| `roles` | `list`, `get <ref>`, `create`, `update <ref>`, `upsert <foreign-id>`, `delete <ref> --yes` |
+| `grants` | `list --principal <ref>` or `list --role <ref>`, `get <grant-oid>`, `create`, `delete <grant-oid> --yes` |
+
+A ref is an exact resource OID or URL-safe foreign ID, never a display name. Reference length is limited to 256 bytes. Dots are encoded in requests so Rails does not mistake foreign IDs for format suffixes. Grants and their secret references use OIDs only.
+
+`list` aggregates every page as `{"items":[...]}`; `--limit 1..200` changes page size, not the total result count. Principal/role lists also accept repeated `--label KEY=VALUE` filters. Resource reads/writes return `{"data":...}`; successful removals return `{"ok":true}`. No partial JSON is printed if a page fails. Lists are not transactional snapshots and stop with an explicit error above 8 MiB or 10,000 pages; individual input/response documents are limited to 1 MiB. Requests have a 5-second connect and 30-second total timeout. Redirects are never followed, and HTTP is allowed only on loopback.
+
+### Provisioning from JSON
+
+**Before creating a principal, review the deployment's default roles, sandbox capabilities and credential reconciliation.** A generic principal can inherit powerful authority even when its input contains no explicit grant. Do not borrow infrastructure identities or describe this as automatic least-privilege provisioning. Creating a principal is not creating or linking a Console user.
+
+Creation and updates take `--file PATH` or `--file -` (stdin), with the existing `data` envelope:
+
+```bash
+printf '%s\n' '{"data":{"name":"Analysts","labels":{"team":"analytics"}}}' \
+  | centaur admin roles upsert analysts --file - --json
+printf '%s\n' '{"data":{"name":"Analytics worker","sandbox_repo_cache":"none"}}' \
+  | centaur admin principals upsert analytics-worker --file - --json
+centaur admin principals roles list analytics-worker
+centaur admin principals roles add analytics-worker analysts
+centaur admin principals effective-config analytics-worker
+```
+
+`create` fails on duplicates. `update` requires an existing resource and resolves foreign IDs to OIDs before PATCH, so typos cannot create records. `upsert` sends a direct server-side PUT by foreign ID; repeated calls retain the resource OID. Neither update nor upsert revokes omitted role assignments or grants. Supplied labels replace the label object; omitted fields are retained. Only create/upsert may include `foreign_id`, which must match the upsert argument.
+
+Role documents support `name`, `labels` and optional create/upsert `foreign_id`. Principal documents additionally support `sandbox_repo_cache` (`none`, `public`, `all`) and boolean `sandbox_observability_enabled`, `sandbox_sessions_read_enabled`, `sandbox_workflows_read_enabled`, `sandbox_workflows_write_enabled`. Unknown fields, account-linking/Slack identity fields and global default-role policy are rejected; they are not provisioned implicitly. Native Console personal-principal provisioning remains separate.
+
+To grant an existing secret to a role, substitute OIDs from your authorized Console inventory:
+
+```bash
+printf '%s\n' '{"data":{"role_id":"role_RETURNED_ID","static_secret_id":"ssr_EXISTING_ID"}}' \
+  | centaur admin grants create --file - --json
+centaur admin grants list --role analysts
+```
+
+A grant document requires exactly one `principal_id` or `role_id`, plus exactly one of `static_secret_id`, `gcp_auth_secret_id`, `gcp_id_token_secret_id`, `aws_auth_secret_id`, `oauth_token_secret_id`, `pg_dsn_secret_id`, `hmac_secret_id`, `ssh_key_secret_id`. Secret values are never requested. Repeating an identical grant/assignment is idempotent on the server. Grant lists show **direct** grants; effective config is server-redacted, not an upstream authorization test.
+
+Role deletion, assignment removal and grant deletion require `--yes`; without it no request is sent. Deleting a role removes all its grants/assignments, not principals or secrets. Removing one grant does not revoke access supplied by another inherited/direct grant. No mutation is automatically retried after transport failure: inspect `get`/`list` before resubmitting because the server may already have committed. Error response bodies are deliberately omitted because they can contain credentials.
+
+**Not available:** users, API clients and principal deletion. Their existing endpoints deliberately require Console sessions; operator keys do not gain that authority. No cookie scraping, new administrative scopes, secret creation, Terraform provider or declarative reconciler is included. See the [administration plan](../../docs/architecture/plan-centaur-cli-administration.md) for the unresolved authentication gate.
 
 ## External integrations (requires matching Console and API versions)
 

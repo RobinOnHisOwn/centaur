@@ -188,6 +188,32 @@ module Api
         assert_equal "Edge", data["name"]
       end
 
+      %i[validation database].each do |guard|
+        test "PUT retries once when a concurrent role upsert wins the #{guard} guard" do
+          calls = 0
+          RolesController.define_method(:resolve_for_upsert) do |model|
+            calls += 1
+            return super(model) unless calls == 1
+
+            model.create!(foreign_id: "raced-role", name: "winner", created_by: current_user)
+            raise ActiveRecord::RecordNotUnique if guard == :database
+
+            model.new(foreign_id: "raced-role", created_by: current_user)
+          end
+          RolesController.send(:private, :resolve_for_upsert)
+
+          assert_difference -> { Role.count } => 1 do
+            put api_v1_role_url(id: "raced-role"),
+                params: { data: { name: "Updated" } }.to_json, headers: auth_headers
+          end
+          assert_response :ok
+          assert_equal "Updated", Role.find_by!(foreign_id: "raced-role").name
+          assert_equal 2, calls
+        ensure
+          RolesController.send(:remove_method, :resolve_for_upsert)
+        end
+      end
+
       test "PUT by foreign_id updates an existing role without creating" do
         role = roles(:acme_infra)
         body = { data: { name: "Renamed" } }

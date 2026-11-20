@@ -1457,7 +1457,7 @@ A grant attaches exactly one secret to a **grantee** — either a principal or a
 
 ### Create
 
-`POST /api/v1/grants` — supply exactly one grantee (`principal_id` **or** `role_id`) plus exactly one of `static_secret_id`, `gcp_auth_secret_id`, `aws_auth_secret_id`, `oauth_token_secret_id`, `pg_dsn_secret_id`, `hmac_secret_id`, or `ssh_key_secret_id`:
+`POST /api/v1/grants` — supply exactly one grantee (`principal_id` **or** `role_id`) plus exactly one of `static_secret_id`, `gcp_auth_secret_id`, `gcp_id_token_secret_id`, `aws_auth_secret_id`, `oauth_token_secret_id`, `pg_dsn_secret_id`, `hmac_secret_id`, or `ssh_key_secret_id`:
 
 ```json
 { "data": { "principal_id": "prn_...", "static_secret_id": "ssr_..." } }
@@ -1483,7 +1483,7 @@ Returns `201`. The response includes the one grantee key and the one secret-type
 }
 ```
 
-Referencing a missing grantee or secret returns `404`. Supplying no grantee returns `422` with `"must reference one of principal_id, role_id"`; supplying no secret returns `422` with `"must reference one of static_secret_id, gcp_auth_secret_id, aws_auth_secret_id, oauth_token_secret_id, pg_dsn_secret_id, hmac_secret_id, ssh_key_secret_id"`.
+Supplying zero or multiple nonblank grantee or secret references returns `422` with `"must reference exactly one of ..."` before either reference is resolved. The API never silently chooses the first of conflicting selectors. For a document with valid selector counts, referencing a missing grantee or secret returns `404`. This validation is shared by bearer, Console-session and sandbox-admin grant endpoints; their separate authentication policies are unchanged.
 
 ### List by grantee
 

@@ -2,6 +2,14 @@
 
 Source inspected: paradigmxyz/centaur `6e293ead961dcd7800a1c6dba456d6f8e5b1e9ee` (2026-11-12). This is upstream source evidence, not a claim about a deployed installation.
 
+## Console administration addition (2026-11-20)
+
+`admin` remains in this executable but uses a focused Console HTTP client in `src/admin.rs`, not the api-rs session client. Admin endpoint/key settings are separate, stored by the existing atomic protected config writer and bound to the admin destination. Chat/client credentials, browser cookies and sandbox tokens are never substituted. Administrative requests disable redirects and retries, bound input/response/list sizes, validate write documents and encode dotted foreign IDs before Rails format recognition.
+
+The first delivery covers existing bearer operations: generic principals, roles, assignments, direct grants and redacted effective config. Users, API clients and principal deletion deliberately remain absent because those existing endpoints are Console-session-only. No server authentication namespace is widened. Role upserts retry a server-local uniqueness race once, and shared grant validation rejects ambiguous selector counts before resolving references; HTTP mutation retries remain disabled.
+
+A future provider can use the underlying API; no provider framework, state database, bulk reconciler or credential provisioning system is introduced. See [README](README.md#console-administration), [plan](../../docs/architecture/plan-centaur-cli-administration.md) and [validation](VALIDATION.md#console-administration--2026-11-20).
+
 ## Reuse
 
 - `crates/centaur-session-cli`: existing Rust CLI, Ratatui/Crossterm UI, and neutral user input. Extend it; Pi's local SDK/RPC client would start a local subprocess and is the wrong remote boundary.

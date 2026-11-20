@@ -26,6 +26,14 @@ use crate::{Args, HarnessTypeArg, tui, user_input_line};
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Administer Console through a separate operator key (not chat credentials).
+    Admin {
+        #[command(subcommand)]
+        command: crate::admin::AdminCommand,
+        /// Emit one JSON object, with diagnostics on stderr.
+        #[arg(long, global = true)]
+        json: bool,
+    },
     /// Inspect or change local configuration (environment values take precedence).
     Config {
         #[command(subcommand)]
@@ -189,7 +197,7 @@ fn config_path() -> Result<PathBuf> {
     Ok(root.join("centaur/config.json"))
 }
 
-fn load_config() -> Result<Value> {
+pub(super) fn load_config() -> Result<Value> {
     match fs::read(config_path()?) {
         Ok(bytes) => {
             use std::os::unix::fs::PermissionsExt;
@@ -198,7 +206,7 @@ fn load_config() -> Result<Value> {
             if !config.is_object() {
                 bail!("Centaur configuration must be an object")
             }
-            if config["client-secret"].is_string()
+            if (config["client-secret"].is_string() || config["admin-api-key"].is_string())
                 && fs::metadata(config_path()?)?.permissions().mode() & 0o077 != 0
             {
                 bail!("credential configuration must have permissions 0600")
@@ -210,7 +218,7 @@ fn load_config() -> Result<Value> {
     }
 }
 
-fn save_config(config: &Value) -> Result<()> {
+pub(super) fn save_config(config: &Value) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let path = config_path()?;
     let parent = path
@@ -237,7 +245,7 @@ fn save_config(config: &Value) -> Result<()> {
     result
 }
 
-fn endpoint(value: &str) -> Result<String> {
+pub(super) fn endpoint(value: &str) -> Result<String> {
     let url = reqwest::Url::parse(value).wrap_err("endpoint must be an absolute HTTPS URL")?;
     let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
     if !(url.scheme() == "https" || (url.scheme() == "http" && local))
@@ -254,7 +262,7 @@ fn endpoint(value: &str) -> Result<String> {
     Ok(value.trim_end_matches('/').to_owned())
 }
 
-fn setting(config: &Value, name: &str, variable: &str) -> Result<String> {
+pub(super) fn setting(config: &Value, name: &str, variable: &str) -> Result<String> {
     env::var(variable)
         .ok()
         .filter(|s| !s.is_empty())
@@ -320,16 +328,19 @@ fn thread_key(client_id: &str, name: &str) -> Result<ThreadKey> {
     Ok(ThreadKey::parse(format!("api:{client_id}:{name}"))?)
 }
 
-fn read_secret(stdin: bool) -> Result<String> {
+pub(super) fn read_secret(stdin: bool, prompt: &str, stdin_option: &str) -> Result<String> {
     if stdin {
         let mut secret = String::new();
-        io::stdin().take(16_384).read_to_string(&mut secret)?;
+        io::stdin().take(16_385).read_to_string(&mut secret)?;
+        if secret.len() > 16_384 {
+            bail!("credential input exceeds 16 KiB")
+        }
         return Ok(secret.trim_end_matches(['\r', '\n']).to_owned());
     }
     if !io::stdin().is_terminal() {
-        bail!("login needs a terminal or --secret-stdin")
+        bail!("login needs a terminal or {stdin_option}")
     }
-    eprint!("Centaur API client secret: ");
+    eprint!("{prompt}: ");
     io::stderr().flush()?;
     enable_raw_mode()?;
     let result = (|| -> Result<String> {
@@ -345,7 +356,12 @@ fn read_secret(stdin: bool) -> Result<String> {
                     KeyCode::Backspace => {
                         secret.pop();
                     }
-                    KeyCode::Char(c) => secret.push(c),
+                    KeyCode::Char(c) => {
+                        if secret.len() + c.len_utf8() > 16_384 {
+                            bail!("credential input exceeds 16 KiB")
+                        }
+                        secret.push(c);
+                    }
                     _ => {}
                 }
             }
@@ -447,6 +463,7 @@ fn print_receipt(
 pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
     let mut config = load_config()?;
     match command {
+        Command::Admin { command, json } => return crate::admin::run(command, *json).await,
         Command::Config {
             command: ConfigCommand::Show,
         } => show_config(&config, args)?,
@@ -492,7 +509,7 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
             }
             let secret = match env::var("CENTAUR_CLIENT_SECRET").ok() {
                 Some(secret) => secret,
-                None => read_secret(*secret_stdin)?,
+                None => read_secret(*secret_stdin, "Centaur API client secret", "--secret-stdin")?,
             };
             if secret.trim().is_empty() {
                 bail!("client secret must not be empty")

@@ -33,6 +33,7 @@ module Api
       # PUT/PATCH upserts: an opaque id updates that record, any other identifier
       # is a foreign_id that is created when absent. foreign_id is immutable.
       def update
+        retried ||= false
         role = resolve_for_upsert(Role)
         was_new = role.new_record?
         ActiveRecord::Base.transaction do
@@ -41,7 +42,16 @@ module Api
           replace_slack_channel_permissions!(role) if data_params.key?(:slack_channel_permissions)
         end
         render status: (was_new ? :created : :ok), json: { data: record_payload(role) }
+      rescue ActiveRecord::RecordNotUnique
+        raise if retried
+
+        retried = true
+        retry
       rescue ActiveRecord::RecordInvalid => e
+        if !retried && e.record.errors.of_kind?(:foreign_id, :taken)
+          retried = true
+          retry
+        end
         render_validation_error(e.record)
       end
 

@@ -2,6 +2,40 @@
 
 Verified locally on 2026-11-12. Base revision: `6e293ead961dcd7800a1c6dba456d6f8e5b1e9ee`; branch: `feat/terminal-workflow`. No deployment or cluster mutation was performed. Git history records subsequent source publication; publication does not establish live acceptance.
 
+## Console administration — 2026-11-20
+
+First-delivery implementation on `feat/cli-administration`, based on `e94d1cfb4a469abc60b89b959407c7dfe00f6f63`. The following is local Linux evidence, separate from the historical macOS/session validation below. No real credentials, deployment, installed executable, dependencies or lockfiles were changed; source/build artifacts only. Console-only users/API clients/principal deletion remain gated by the [plan](../../docs/architecture/plan-centaur-cli-administration.md).
+
+| Check | Observed result | Scope |
+| --- | --- | --- |
+| CLI Rust unit tests | 13 passed | Existing parser/editor/session checks, Rust 1.99.1 |
+| Existing executable configuration fixture | 23 passed | Chat login, configuration, events and lifecycle remain compatible |
+| New `tests/cli_admin.py` | 15 passed | Loopback HTTP and subprocess commands, synthetic credentials only |
+| Ten affected Rails request suites | 250 runs, 4,875 assertions; no failures/errors/skips | Actual disposable PostgreSQL/pgvector 16; includes credential namespace sweep and existing Console-only/sandbox tests |
+| Real CLI → Rails → PostgreSQL | Passed | Separate disposable database, loopback Rails server; role/principal upsert/get, exact dotted identity round-trip, assignments, label pagination, redacted config, grant create/repeat/read/list/delete, update-only failure and role deletion |
+| CLI strict Clippy | Passed with `--no-deps --all-targets -- -D warnings` | Existing dependency dead-code warning for `RouteAccess::ConsoleServiceOnly` remains; CLI has no new warnings |
+| Changed Ruby files RuboCop | Passed | Controllers and their regression tests |
+| Full Console RuboCop | Existing unrelated failure | Extra blank line in unchanged `personal_mcp_connections_controller.rb:19`; reproduced from baseline source, not corrected here |
+| Canonical `bin/brakeman` | Blocked by its latest-version check | Locked Brakeman 8.1.0 reports 8.1.1 available; no dependency update made |
+| Supplemental pinned `bundle exec brakeman` scan | 0 scanner errors, 0 security warnings | Scanner 8.1.0 only; this does not satisfy the canonical latest-version gate. Existing Bundler constant-redefinition warnings also appear. |
+
+The new executable fixture was first run against the baseline and failed because `admin` did not exist. Added server tests first reproduced ambiguous grants being created and concurrent role upserts failing at both validation/database uniqueness guards; the minimal shared-controller fixes pass those tests. A separate stdin test first demonstrated silent truncation of an oversized credential, then verified rejection without saving or networking.
+
+The real HTTP probe caught a limitation in the original synthetic fixture: Rails interpreted literal dots as format suffixes, and matching returned OIDs alone could falsely pass after writing the wrong foreign ID. A direct percent-encoded request verified the established routing behavior; the shared client request boundary now encodes dots. The permanent executable fixture checks encoded requests, and the real HTTP check asserts the returned `foreign_id` exactly equals the requested value before checking OIDs.
+
+Reproduce the CLI checks from the repository root with its Rust toolchain loaded and `CENTAUR_CLI_TEST_BINARY` set to the actual built binary:
+
+```bash
+cargo test --locked -p centaur-session-cli
+cargo build --locked -p centaur-session-cli
+python3 crates/centaur-session-cli/tests/cli_configuration.py
+python3 crates/centaur-session-cli/tests/cli_admin.py
+cargo clippy --locked -p centaur-session-cli --all-targets --no-deps -- -D warnings
+cargo fmt --all -- --check
+```
+
+For the ten Rails suites, use the [plan's verification commands](../../docs/architecture/plan-centaur-cli-administration.md#verification) including `test/controllers/api/v1/sandbox_admin_controller_test.rb`, with `PARALLEL_WORKERS=1` and dedicated `CENTAUR_CONSOLE_TEST_DB_NAME`/`CENTAUR_CONSOLE_DEV_DB_NAME` values. Do not reuse Rust Console-schema fixture databases or any deployment database. The real HTTP check used another dedicated database and synthetic active admin/operator key plus a placeholder secret record, never a real provider credential or sandbox. It starts no chat execution and proves no deployment ingress, SSO, real proxy traffic or model behavior. Test servers were stopped afterward. Build/install/deployment remain distinct.
+
 ## Delivered artifacts
 
 - Existing `centaur-session-cli` extended, not replaced with another runtime/client platform.

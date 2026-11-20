@@ -25,11 +25,12 @@ module Api
       def create
         attrs = data_params.permit(*GRANTEE_TYPES.keys, *GRANTABLE_TYPES.keys)
 
-        grantee_key, grantee = resolve_one(attrs, GRANTEE_TYPES)
-        return render_missing(GRANTEE_TYPES) unless grantee_key
+        [ GRANTEE_TYPES, GRANTABLE_TYPES ].each do |types|
+          return render_missing(types) unless types.keys.count { |key| attrs[key].present? } == 1
+        end
 
+        grantee_key, grantee = resolve_one(attrs, GRANTEE_TYPES)
         grantable_key, grantable = resolve_one(attrs, GRANTABLE_TYPES)
-        return render_missing(GRANTABLE_TYPES) unless grantable_key
 
         # Granting the same secret to the same grantee is idempotent: a repeat
         # returns the existing grant with 200 rather than a duplicate row. A
@@ -54,11 +55,10 @@ module Api
       private
 
       # Picks the single present key from a {param_key => Model} map and loads the
-      # referenced record (404 if it does not exist). Returns nil when no key is
-      # present; the caller turns that into a validation error.
+      # referenced record (404 if it does not exist). The caller validates both
+      # selector counts before resolving either record.
       def resolve_one(attrs, types)
         key = types.keys.find { |k| attrs[k].present? }
-        return nil unless key
         [ key, types.fetch(key).find_by_oid!(attrs[key]) ]
       end
 
@@ -69,7 +69,7 @@ module Api
       def render_missing(types)
         render status: :unprocessable_entity, json: {
           error: { message: "validation failed",
-                   details: { base: [ "must reference one of #{types.keys.join(", ")}" ] } }
+                   details: { base: [ "must reference exactly one of #{types.keys.join(", ")}" ] } }
         }
       end
 
