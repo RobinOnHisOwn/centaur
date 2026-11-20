@@ -9,6 +9,7 @@ First-delivery implementation on `feat/cli-administration`, based on `e94d1cfb4a
 | Check | Observed result | Scope |
 | --- | --- | --- |
 | CLI Rust unit tests | 13 passed | Existing parser/editor/session checks, Rust 1.99.1 |
+| Nix package build and packaged-binary checks | Passed on x86_64-linux at `49e6f75b` | Release/check/install phases completed; 13 Rust tests passed inside the build, then 15 admin and 23 configuration tests passed against the resulting `$out/bin/centaur` |
 | Existing executable configuration fixture | 23 passed | Chat login, configuration, events and lifecycle remain compatible |
 | New `tests/cli_admin.py` | 15 passed | Loopback HTTP and subprocess commands, synthetic credentials only |
 | Ten affected Rails request suites | 250 runs, 4,875 assertions; no failures/errors/skips | Actual disposable PostgreSQL/pgvector 16; includes credential namespace sweep and existing Console-only/sandbox tests |
@@ -33,6 +34,17 @@ python3 crates/centaur-session-cli/tests/cli_admin.py
 cargo clippy --locked -p centaur-session-cli --all-targets --no-deps -- -D warnings
 cargo fmt --all -- --check
 ```
+
+Verify the actual Nix package as well as a standalone Cargo build:
+
+```bash
+OUT=$(nix build --no-link --print-out-paths .#centaur-session-cli) || exit
+"$OUT/bin/centaur" admin --help
+CENTAUR_CLI_TEST_BINARY="$OUT/bin/centaur" python3 crates/centaur-session-cli/tests/cli_admin.py
+CENTAUR_CLI_TEST_BINARY="$OUT/bin/centaur" python3 crates/centaur-session-cli/tests/cli_configuration.py
+```
+
+These commands passed locally on x86_64-linux. `Cargo.lock`, the workspace/CLI manifests and `nix/centaur-session-cli.nix` are unchanged from base commit `e94d1cfb`, which already corrected `cargoHash`; no further hash change was needed. This verifies the Nix package, not Home Manager activation, deployment, macOS or another architecture. Do not infer package-install readiness from a standalone Cargo build alone.
 
 For the ten Rails suites, use the [plan's verification commands](../../docs/architecture/plan-centaur-cli-administration.md#verification) including `test/controllers/api/v1/sandbox_admin_controller_test.rb`, with `PARALLEL_WORKERS=1` and dedicated `CENTAUR_CONSOLE_TEST_DB_NAME`/`CENTAUR_CONSOLE_DEV_DB_NAME` values. Do not reuse Rust Console-schema fixture databases or any deployment database. The real HTTP check used another dedicated database and synthetic active admin/operator key plus a placeholder secret record, never a real provider credential or sandbox. It starts no chat execution and proves no deployment ingress, SSO, real proxy traffic or model behavior. Test servers were stopped afterward. Build/install/deployment remain distinct.
 
