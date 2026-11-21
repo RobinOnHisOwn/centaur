@@ -185,6 +185,17 @@
         "enabled": { "type": "boolean" }
       }
     },
+    "cliAuth": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "sessionResource": { "type": "string" },
+        "signingKeySecretName": { "type": "string" },
+        "signingKeySecretKey": { "type": "string" },
+        "verificationKeysSecretName": { "type": "string" },
+        "verificationKeysSecretKey": { "type": "string" }
+      }
+    },
     "console": { "$ref": "#/definitions/consoleConfig" },
     "ironControl": { "$ref": "#/definitions/consoleConfig" },
     "secrets": {

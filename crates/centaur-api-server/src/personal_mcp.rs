@@ -72,8 +72,15 @@ pub(crate) async fn list(
     client: Option<Extension<ApiClientContext>>,
 ) -> Result<Json<Value>, ApiError> {
     let owner = identity(&state, client).await?;
+    list_owner(&state, &owner).await
+}
+
+pub(crate) async fn list_owner(
+    state: &AppState,
+    owner: &PersonalMcpIdentity,
+) -> Result<Json<Value>, ApiError> {
     Ok(Json(
-        json!({"items":connections(&state,&owner).await?,"principal":oid("prn",owner.principal_id),"configuration_source":"console_integrations"}),
+        json!({"items":connections(state,owner).await?,"principal":oid("prn",owner.principal_id),"configuration_source":"console_integrations"}),
     ))
 }
 
@@ -85,8 +92,16 @@ pub(crate) async fn connect(
     Json(server): Json<McpServer>,
 ) -> Result<Json<Value>, ApiError> {
     let owner = identity(&state, client).await?;
+    connect_owner(&state, &owner, server).await
+}
+
+pub(crate) async fn connect_owner(
+    state: &AppState,
+    owner: &PersonalMcpIdentity,
+    server: McpServer,
+) -> Result<Json<Value>, ApiError> {
     server.validate().map_err(ApiError::BadRequest)?;
-    let item = connections(&state,&owner).await?.into_iter().find(|item|item.name==server.name && reqwest::Url::parse(&item.url).ok()==reqwest::Url::parse(&server.url).ok())
+    let item = connections(state, owner).await?.into_iter().find(|item|item.name==server.name && reqwest::Url::parse(&item.url).ok()==reqwest::Url::parse(&server.url).ok())
         .ok_or_else(||ApiError::BadRequest("no matching MCP-enabled Console OAuth app; an operator must register it in the existing Integrations setup first".into()))?;
     Ok(Json(
         json!({"ok":true,"integration":item,"authorization_url":consent_url(&item)?,"configuration_source":"console_integrations","requires_console_login":true}),
@@ -99,7 +114,15 @@ pub(crate) async fn login(
     Path(name): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let owner = identity(&state, client).await?;
-    let item = connections(&state, &owner)
+    login_owner(&state, &owner, name).await
+}
+
+pub(crate) async fn login_owner(
+    state: &AppState,
+    owner: &PersonalMcpIdentity,
+    name: String,
+) -> Result<Json<Value>, ApiError> {
+    let item = connections(state, owner)
         .await?
         .into_iter()
         .find(|item| item.name == name)
@@ -144,12 +167,21 @@ pub(crate) async fn snapshot(
     if principal != oid("prn", owner.principal_id) {
         return Ok(());
     }
+    snapshot_owner(state, &owner, metadata).await
+}
+
+pub(crate) async fn snapshot_owner(
+    state: &AppState,
+    owner: &PersonalMcpIdentity,
+    metadata: &mut Value,
+) -> Result<(), ApiError> {
+    let principal = oid("prn", owner.principal_id);
     if !owner.active {
         return Err(ApiError::Forbidden(
             "personal Console account is disabled".into(),
         ));
     }
-    let servers = connections(state, &owner)
+    let servers = connections(state, owner)
         .await?
         .into_iter()
         .filter(|item| item.available)

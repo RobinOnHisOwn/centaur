@@ -263,9 +263,17 @@ spec:
             - name: CENTAUR_MCP_PUBLIC_URL
               value: {{ $mcpPublicUrl | quote }}
 {{- end }}
-{{- if $console.publicUrl }}
+{{- if or $console.publicUrl .Values.cliAuth.enabled }}
             - name: CENTAUR_CONSOLE_PUBLIC_URL
-              value: {{ $console.publicUrl | quote }}
+              value: {{ required "console.publicUrl is required when CLI auth is enabled" $console.publicUrl | quote }}
+{{- end }}
+{{- if .Values.cliAuth.enabled }}
+            - name: CENTAUR_CLI_AUTH_ENABLED
+              value: "true"
+            - name: CENTAUR_CLI_VERIFICATION_KEYS_FILE
+              value: {{ printf "/var/run/secrets/centaur-cli/verification/%s" .Values.cliAuth.verificationKeysSecretKey | quote }}
+            - name: CENTAUR_CLI_SESSION_RESOURCE
+              value: {{ required "cliAuth.sessionResource is required when CLI auth is enabled" .Values.cliAuth.sessionResource | quote }}
 {{- end }}
             - name: RUN_MIGRATIONS
               value: {{ .Values.apiRs.runMigrations | quote }}
@@ -720,14 +728,27 @@ spec:
 {{ toYaml .Values.containerSecurityContext | nindent 12 }}
           resources:
 {{ toYaml .Values.apiRs.resources | nindent 12 }}
-{{- if $useOverlayRepoCache }}
+{{- if or $useOverlayRepoCache .Values.cliAuth.enabled }}
           volumeMounts:
+{{- if $useOverlayRepoCache }}
             - name: repo-cache
               mountPath: {{ .Values.repoCache.hostPath | quote }}
               readOnly: true
 {{- end }}
-{{- if $useOverlayRepoCache }}
+{{- if .Values.cliAuth.enabled }}
+            - name: cli-verification-keys
+              mountPath: /var/run/secrets/centaur-cli/verification
+              readOnly: true
+{{- end }}
+{{- end }}
+{{- if or $useOverlayRepoCache .Values.cliAuth.enabled }}
       volumes:
+{{- if .Values.cliAuth.enabled }}
+        - name: cli-verification-keys
+          secret:
+            secretName: {{ required "cliAuth.verificationKeysSecretName is required when CLI auth is enabled" .Values.cliAuth.verificationKeysSecretName | quote }}
+            defaultMode: 0444
+{{- end }}
         - name: repo-cache
 {{- if $repoCacheUsePvc }}
           persistentVolumeClaim:

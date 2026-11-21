@@ -355,7 +355,8 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             get(mcp_protected_resource_metadata),
         )
         .route("/api/webhooks/{slug}", any(invoke_workflow_webhook))
-        .merge(protected);
+        .merge(protected)
+        .merge(crate::cli_routes::router(state.clone()));
     let app = if state.auth().api_clients_enabled() {
         app.route("/oauth/token", post(issue_api_client_token))
     } else {

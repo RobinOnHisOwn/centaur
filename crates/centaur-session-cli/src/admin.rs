@@ -234,6 +234,8 @@ struct Console {
     http: reqwest::Client,
     base: String,
     authorization: HeaderValue,
+    human: bool,
+    human_tokens: Option<std::sync::Arc<crate::browser_auth::Tokens>>,
 }
 
 impl Console {
@@ -247,6 +249,11 @@ impl Console {
         {
             bail!("operator key must have the iak_ prefix followed by 64 lowercase hex characters")
         }
+        Self::authenticated(base, key, false)
+    }
+
+    fn authenticated(base: String, key: &str, human: bool) -> Result<Self> {
+        let key = if human { "browser-token" } else { key };
         let mut authorization = HeaderValue::from_str(&format!("Bearer {key}"))
             .map_err(|_| eyre!("invalid operator key"))?;
         authorization.set_sensitive(true);
@@ -257,10 +264,13 @@ impl Console {
             .retry(reqwest::retry::never())
             .build()
             .map_err(|_| eyre!("could not initialize Console HTTP client"))?;
+        let human_tokens = human.then(|| crate::browser_auth::Tokens::new(base.clone()));
         Ok(Self {
             http,
             base,
             authorization,
+            human,
+            human_tokens,
         })
     }
 
@@ -298,15 +308,28 @@ impl Console {
         };
         // Rails recognizes literal dots as format suffixes before decoding route captures.
         let path = path.replace('.', "%2E");
-        let mut url = reqwest::Url::parse(&format!("{}/api/v1/{path}", self.base))
+        let prefix = if self.human {
+            self.base.clone()
+        } else {
+            format!("{}/api/v1", self.base)
+        };
+        let mut url = reqwest::Url::parse(&format!("{prefix}/{path}"))
             .map_err(|_| eyre!("invalid Console request URL"))?;
         if !query.is_empty() {
             url.query_pairs_mut().extend_pairs(query);
         }
+        let authorization = if let Some(tokens) = &self.human_tokens {
+            let token = tokens.token().await?;
+            let mut value = HeaderValue::from_str(&format!("Bearer {token}"))?;
+            value.set_sensitive(true);
+            value
+        } else {
+            self.authorization.clone()
+        };
         let mut request = self
             .http
             .request(method, url)
-            .header(AUTHORIZATION, self.authorization.clone());
+            .header(AUTHORIZATION, authorization);
         if let Some(body) = body {
             request = request.json(body);
         }
@@ -594,8 +617,34 @@ async fn resource_command(
     }
 }
 
-pub(crate) async fn run(command: &AdminCommand, json_output: bool) -> Result<()> {
+pub(crate) async fn run(
+    command: &AdminCommand,
+    json_output: bool,
+    args: &crate::Args,
+) -> Result<()> {
+    let _lock = if matches!(
+        command,
+        AdminCommand::Config {
+            command: AdminConfigCommand::Set { .. } | AdminConfigCommand::Unset { .. }
+        } | AdminCommand::Login { .. }
+            | AdminCommand::Logout
+    ) {
+        Some(crate::browser_auth::lock()?)
+    } else {
+        None
+    };
     let mut config = load_config()?;
+    if args.auth_mode.as_deref() == Some("machine") {
+        bail!("machine mode is for chat; use user or operator for admin")
+    }
+    if crate::browser_auth::selected(&config, args)
+        && matches!(command, AdminCommand::Login { .. } | AdminCommand::Logout)
+    {
+        bail!(
+            "browser login is shared; use centaur login/logout. Old operator-key setup requires --auth-mode operator"
+        )
+    }
+
     let value = match command {
         AdminCommand::Config { command } => {
             match command {
@@ -652,11 +701,16 @@ pub(crate) async fn run(command: &AdminCommand, json_output: bool) -> Result<()>
             json!({"ok": true, "message": "Operator authorization verified; key saved (mode 0600), not a session-readiness check."})
         }
         _ => {
-            let client = Console::configured(&config)?;
+            let client = if crate::browser_auth::selected(&config, args) {
+                let base = crate::browser_auth::console_resource(&config, args)?;
+                Console::authenticated(base, "", true)?
+            } else {
+                Console::configured(&config)?
+            };
             match command {
                 AdminCommand::Status => {
                     client.authorize().await?;
-                    json!({"data": {"authorized": true, "endpoint": client.base, "auth_mode": "operator_api_key"}})
+                    json!({"data": {"authorized": true, "endpoint": client.base, "auth_mode": if client.human {"browser"}else{"operator_api_key"}}})
                 }
                 AdminCommand::Principals {
                     command: PrincipalCommand::Resource(command),

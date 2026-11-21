@@ -16,6 +16,15 @@ class ConsoleUserPrincipalProvisionerTest < ActiveSupport::TestCase
     assert_includes @principal.roles, Role.find_by!(foreign_id: "user-mcp")
   end
 
+  test "email changes preserve the durable personal principal" do
+    user = users(:member_user)
+    principal = ConsoleUserPrincipalProvisioner.call(user)
+    user.update!(email: "new-personal-address@example.test")
+    assert_no_difference -> { Principal.count } do
+      assert_equal principal, ConsoleUserPrincipalProvisioner.call(user)
+    end
+  end
+
   test "repeated calls leave an unchanged principal untouched" do
     user = users(:member_user)
     principal = ConsoleUserPrincipalProvisioner.call(user)

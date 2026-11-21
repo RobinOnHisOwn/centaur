@@ -26,6 +26,7 @@ module ConsoleReturnPath
       %r{\A/\z},
       %r{\A/console(?:/[A-Za-z0-9_\-./~%:@]*)?\z},
       %r{\A/mcp/oauth/authorize(?:\.html)?\z},
+      %r{\A/cli/oauth/authorize\z},
       %r{\A/oauth/#{oauth_slug_source}/(?:start|callback)(?:\.html)?\z},
       %r{\A/launch\z}
     ].freeze

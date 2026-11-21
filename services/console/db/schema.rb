@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_11_20_125247) do
+ActiveRecord::Schema[8.1].define(version: 2026_11_21_000756) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -104,6 +104,38 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_20_125247) do
     t.index ["next_attempt_at"], name: "index_broker_credentials_on_next_attempt_at"
     t.index ["oauth_app_id", "provider_subject"], name: "index_broker_credentials_on_oauth_app_id_and_provider_subject", unique: true, where: "(provider_subject IS NOT NULL)"
     t.index ["oauth_app_id"], name: "index_broker_credentials_on_oauth_app_id"
+  end
+
+  create_table "cli_oauth_authorization_codes", force: :cascade do |t|
+    t.bigint "user_id", null: false
+    t.string "code_hash", null: false
+    t.string "redirect_uri", null: false
+    t.string "code_challenge", null: false
+    t.jsonb "scopes", default: [], null: false
+    t.jsonb "resources", default: [], null: false
+    t.datetime "expires_at", null: false
+    t.datetime "consumed_at"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["code_hash"], name: "index_cli_oauth_authorization_codes_on_code_hash", unique: true
+    t.index ["user_id"], name: "index_cli_oauth_authorization_codes_on_user_id"
+  end
+
+  create_table "cli_oauth_refresh_tokens", force: :cascade do |t|
+    t.bigint "user_id", null: false
+    t.string "token_hash", null: false
+    t.uuid "connection_id", null: false
+    t.jsonb "scopes", default: [], null: false
+    t.jsonb "resources", default: [], null: false
+    t.datetime "expires_at", null: false
+    t.datetime "connection_expires_at", null: false
+    t.datetime "used_at"
+    t.datetime "revoked_at"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["connection_id"], name: "index_cli_oauth_refresh_tokens_on_connection_id"
+    t.index ["token_hash"], name: "index_cli_oauth_refresh_tokens_on_token_hash", unique: true
+    t.index ["user_id"], name: "index_cli_oauth_refresh_tokens_on_user_id"
   end
 
   create_table "gcp_auth_secrets", force: :cascade do |t|
@@ -630,6 +662,8 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_20_125247) do
   add_foreign_key "aws_auth_secrets", "users", column: "created_by_id"
   add_foreign_key "broker_credentials", "oauth_apps"
   add_foreign_key "broker_credentials", "users", column: "created_by_id"
+  add_foreign_key "cli_oauth_authorization_codes", "users"
+  add_foreign_key "cli_oauth_refresh_tokens", "users"
   add_foreign_key "gcp_auth_secrets", "users", column: "created_by_id"
   add_foreign_key "gcp_id_token_secrets", "users", column: "created_by_id"
   add_foreign_key "grants", "aws_auth_secrets"

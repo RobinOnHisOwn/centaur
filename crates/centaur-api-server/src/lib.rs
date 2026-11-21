@@ -1,6 +1,8 @@
 mod api_clients;
 mod api_jwt;
 mod auth;
+mod cli_auth;
+mod cli_routes;
 pub mod client;
 #[cfg(test)]
 mod client_tests;
@@ -33,7 +35,27 @@ pub fn warm_slack_public_channel_cache() {
 
 #[cfg(test)]
 mod tests {
+    mod cli_browser;
     mod personal_mcp;
+
+    #[tokio::test]
+    async fn human_cli_routes_never_accept_internal_operator_credentials() {
+        let app = build_router_with_app_state(AppState::unready(test_auth()));
+        for token in ["admin", "iak_fixture", "not-a-jwt"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/cli/v1/me")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
 
     use std::sync::{
         Arc,

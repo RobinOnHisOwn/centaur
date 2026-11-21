@@ -187,9 +187,9 @@ spec:
             # matches regardless of what Host the sync request carried.
             - name: CENTAUR_CONSOLE_URL
               value: {{ include "centaur.consoleUrl" . | quote }}
-{{- if $console.publicUrl }}
+{{- if or $console.publicUrl .Values.cliAuth.enabled }}
             - name: CENTAUR_CONSOLE_PUBLIC_URL
-              value: {{ $console.publicUrl | quote }}
+              value: {{ required "console.publicUrl is required when CLI auth is enabled" $console.publicUrl | quote }}
 {{- end }}
 {{- with $console.allowedHosts }}
             - name: CENTAUR_CONSOLE_ALLOWED_HOSTS
@@ -276,6 +276,14 @@ spec:
               value: {{ .Values.companyContextV1.enabled | quote }}
             - name: CENTAUR_CONSOLE_API_CLIENTS_ENABLED
               value: {{ .Values.apiClients.enabled | quote }}
+{{- if .Values.cliAuth.enabled }}
+            - name: CENTAUR_CLI_AUTH_ENABLED
+              value: "true"
+            - name: CENTAUR_CLI_SIGNING_KEY_FILE
+              value: {{ printf "/var/run/secrets/centaur-cli/signing/%s" .Values.cliAuth.signingKeySecretKey | quote }}
+            - name: CENTAUR_CLI_SESSION_RESOURCE
+              value: {{ required "cliAuth.sessionResource is required when CLI auth is enabled" .Values.cliAuth.sessionResource | quote }}
+{{- end }}
             - name: PORT
               value: {{ $console.service.httpPort | quote }}
             - name: RAILS_LOG_TO_STDOUT
@@ -319,6 +327,17 @@ spec:
               type: RuntimeDefault
           resources:
 {{ toYaml $console.resources | nindent 12 }}
+{{- if .Values.cliAuth.enabled }}
+          volumeMounts:
+            - name: cli-signing-key
+              mountPath: /var/run/secrets/centaur-cli/signing
+              readOnly: true
+      volumes:
+        - name: cli-signing-key
+          secret:
+            secretName: {{ required "cliAuth.signingKeySecretName is required when CLI auth is enabled" .Values.cliAuth.signingKeySecretName | quote }}
+            defaultMode: 0444
+{{- end }}
 {{- if .Values.networkPolicy.enabled }}
 ---
 apiVersion: networking.k8s.io/v1

@@ -10,6 +10,8 @@ class User < ApplicationRecord
 
   has_many :api_keys, dependent: :destroy
   has_many :mcp_oauth_refresh_tokens, dependent: :destroy
+  has_many :cli_oauth_refresh_tokens, dependent: :destroy
+  has_many :cli_oauth_authorization_codes, dependent: :destroy
   has_many :user_identities, dependent: :destroy
   has_one :personal_ssh_key, class_name: "SshKeySecret", foreign_key: :owner_id, dependent: :destroy, inverse_of: :owner
   has_many :skills, dependent: :destroy
@@ -113,5 +115,8 @@ class User < ApplicationRecord
 
   def revoke_mcp_oauth_refresh_tokens_when_disabled
     revoke_mcp_oauth_refresh_tokens!
+    cli_oauth_refresh_tokens.distinct.pluck(:connection_id).each do |connection_id|
+      cli_oauth_refresh_tokens.find_by(connection_id: connection_id)&.revoke!
+    end
   end
 end

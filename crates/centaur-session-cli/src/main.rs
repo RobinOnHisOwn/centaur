@@ -16,6 +16,7 @@ use tokio::{
 use uuid::Uuid;
 
 mod admin;
+mod browser_auth;
 mod terminal;
 mod tui;
 
@@ -80,11 +81,15 @@ pub(crate) type SseFrame = ApiSseEvent;
 #[derive(Debug, Parser)]
 #[command(
     about = "Control remote Centaur chats and administer Console; agents and tools run on the server",
-    after_help = "Start: config set endpoint <HTTPS-URL>, config set client-id <ID>, login, chat new.\nLegacy execution flags are for invocations without a subcommand.\nUse chat new --harness / --message / --max-duration-ms instead of root flags."
+    after_help = "People: login --server <Console HTTPS URL>, then chat new. Automation: retain upstream environment credentials.\nLegacy execution flags are for invocations without a subcommand.\nUse chat new --harness / --message / --max-duration-ms instead of root flags."
 )]
 struct Args {
     #[command(subcommand)]
     command: Option<terminal::Command>,
+
+    /// Explicit identity selection; browser login never falls back to machine/operator credentials.
+    #[arg(long, global = true, value_parser = ["user", "machine", "operator"])]
+    auth_mode: Option<String>,
 
     #[arg(long, env = "CENTAUR_API_URL")]
     api_url: Option<ApiBaseUrl>,
@@ -223,6 +228,11 @@ async fn main() -> Result<()> {
     });
     if let Some(command) = &args.command {
         return terminal::run(command, &args).await;
+    }
+    if browser_auth::selected(&terminal::load_config()?, &args) {
+        bail!(
+            "legacy raw execution requires --auth-mode machine; use chat commands with browser login"
+        )
     }
     let attach_mode = attach_mode(&args);
     validate_mode(&args, attach_mode)?;

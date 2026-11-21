@@ -16,6 +16,7 @@ Rails.application.routes.draw do
   draw :console_skills
 
   draw :api
+  draw :cli
 
   # HTML navigations to SPA paths serve the built single-page app.
   draw :spa

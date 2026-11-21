@@ -13,6 +13,7 @@ module SpaRequest
     /.well-known
     /up
     /mcp
+    /cli
     /oauth
     /auth
     /login

@@ -99,6 +99,14 @@ toolServer:
 # still honored as a deprecated alias — anything set under `ironControl` is merged
 # on top of these `console` defaults (see the `centaur.consoleValues` helper), so
 # existing values files keep working. Prefer `console` for new configuration.
+cliAuth:
+  enabled: false
+  sessionResource: ""
+  signingKeySecretName: centaur-cli-signing
+  signingKeySecretKey: private.pem
+  verificationKeysSecretName: centaur-cli-verification
+  verificationKeysSecretKey: keys.json
+
 console:
   replicaCount: 1
   # Node steering for the Console web pods. Use tolerations with a matching

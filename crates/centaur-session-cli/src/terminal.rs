@@ -26,7 +26,7 @@ use crate::{Args, HarnessTypeArg, tui, user_input_line};
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Administer Console through a separate operator key (not chat credentials).
+    /// Administer Console using the shared browser identity or explicit operator credentials.
     Admin {
         #[command(subcommand)]
         command: crate::admin::AdminCommand,
@@ -39,14 +39,25 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// Verify API client credentials; this does not verify session readiness.
+    /// Sign in through the browser; --secret-stdin retains explicit machine-client setup.
     Login {
         /// Read the client secret from stdin rather than a hidden terminal prompt.
         #[arg(long)]
         secret_stdin: bool,
+        /// Canonical Console URL, not the session API URL.
+        #[arg(long, conflicts_with = "secret_stdin")]
+        server: Option<String>,
+        /// Print the login URL without launching the system browser (same machine).
+        #[arg(long, conflicts_with = "secret_stdin")]
+        no_open: bool,
     },
-    /// Remove saved local credentials only; does not revoke access or stop work.
+    /// Revoke the browser CLI connection, or remove explicit saved machine credentials.
     Logout,
+    /// Inspect the browser identity and manage your device connections.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     /// Create, inspect and control remote conversations.
     Chat {
         #[command(subcommand)]
@@ -58,6 +69,23 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: McpCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum AuthCommand {
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Connections {
+        #[command(subcommand)]
+        command: ConnectionCommand,
+    },
+}
+#[derive(Debug, Subcommand)]
+pub(crate) enum ConnectionCommand {
+    List,
+    Revoke { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -186,7 +214,7 @@ pub(crate) enum ChatCommand {
     },
 }
 
-fn config_path() -> Result<PathBuf> {
+pub(super) fn config_path() -> Result<PathBuf> {
     if let Some(path) = env::var_os("CENTAUR_CONFIG") {
         return Ok(path.into());
     }
@@ -206,7 +234,9 @@ pub(super) fn load_config() -> Result<Value> {
             if !config.is_object() {
                 bail!("Centaur configuration must be an object")
             }
-            if (config["client-secret"].is_string() || config["admin-api-key"].is_string())
+            if (config["client-secret"].is_string()
+                || config["admin-api-key"].is_string()
+                || config["browser"].is_object())
                 && fs::metadata(config_path()?)?.permissions().mode() & 0o077 != 0
             {
                 bail!("credential configuration must have permissions 0600")
@@ -275,7 +305,13 @@ pub(super) fn setting(config: &Value, name: &str, variable: &str) -> Result<Stri
         .ok_or_else(|| eyre!("configure {name} or set {variable}"))
 }
 
-fn client(config: &Value, args: &Args) -> Result<(CentaurClient, String)> {
+async fn client(config: &Value, args: &Args) -> Result<(CentaurClient, String)> {
+    if crate::browser_auth::selected(config, args) {
+        return crate::browser_auth::client(config, args).await;
+    }
+    if args.auth_mode.as_deref() == Some("operator") {
+        bail!("operator mode is only for admin commands")
+    }
     let url = resolved_endpoint(config, args)?;
     let id = setting(config, "client-id", "CENTAUR_CLIENT_ID")?;
     if !id
@@ -324,6 +360,9 @@ fn thread_key(client_id: &str, name: &str) -> Result<ThreadKey> {
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
     {
         bail!("session name must contain 1–64 ASCII letters, digits, '-' or '_'")
+    }
+    if client_id.starts_with("personal:") && client_id.ends_with(':') {
+        return Ok(ThreadKey::parse(format!("{client_id}{name}"))?);
     }
     Ok(ThreadKey::parse(format!("api:{client_id}:{name}"))?)
 }
@@ -461,9 +500,25 @@ fn print_receipt(
 }
 
 pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
+    let _lock = if matches!(
+        command,
+        Command::Config {
+            command: ConfigCommand::Set { .. } | ConfigCommand::Unset { .. }
+        } | Command::Login {
+            secret_stdin: true,
+            ..
+        }
+    ) {
+        Some(crate::browser_auth::lock()?)
+    } else {
+        None
+    };
     let mut config = load_config()?;
     match command {
-        Command::Admin { command, json } => return crate::admin::run(command, *json).await,
+        Command::Admin { command, json } => return crate::admin::run(command, *json, args).await,
+        Command::Auth { command } => {
+            return crate::browser_auth::auth(command, &config, args).await;
+        }
         Command::Config {
             command: ConfigCommand::Show,
         } => show_config(&config, args)?,
@@ -480,7 +535,12 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
             save_config(&config)?;
             println!("{key} removed from config; environment overrides remain active");
         }
+        Command::Logout if crate::browser_auth::selected(&config, args) => {
+            return crate::browser_auth::logout(args).await;
+        }
         Command::Logout => {
+            let _lock = crate::browser_auth::lock()?;
+            config = load_config()?;
             forget_credential(&mut config);
             save_config(&config)?;
             println!(
@@ -503,7 +563,22 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
             save_config(&config)?;
             println!("{key} configured");
         }
-        Command::Login { secret_stdin } => {
+        Command::Login {
+            secret_stdin: false,
+            server,
+            no_open,
+        } if args.auth_mode.as_deref() == Some("user")
+            || (args.auth_mode.as_deref() != Some("machine")
+                && (server.is_some()
+                    || *no_open
+                    || env::var_os("CENTAUR_CLIENT_SECRET").is_none())) =>
+        {
+            return crate::browser_auth::login(server.as_deref(), *no_open, args).await;
+        }
+        Command::Login { secret_stdin, .. } => {
+            if args.auth_mode.as_deref() == Some("user") {
+                bail!("browser login does not accept machine secrets")
+            }
             if !args.api_token.is_empty() {
                 bail!("unset CENTAUR_API_TOKEN for OAuth client login")
             }
@@ -518,7 +593,10 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
             config["credential-endpoint"] = json!(resolved_endpoint(&config, args)?);
             config["credential-client-id"] =
                 json!(setting(&config, "client-id", "CENTAUR_CLIENT_ID")?);
-            let (client, _) = client(&config, args)?;
+            if crate::browser_auth::selected(&config, args) {
+                bail!("use --auth-mode machine for saved machine-client setup")
+            }
+            let (client, _) = client(&config, args).await?;
             client.authenticate().await?;
             save_config(&config)?;
             println!(
@@ -545,7 +623,7 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
             {
                 bail!("invalid MCP name")
             }
-            let (client, _) = client(&config, args)?;
+            let (client, _) = client(&config, args).await?;
             match command {
                 McpCommand::Add { .. } => {
                     eprintln!(
@@ -609,7 +687,12 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
             }
         }
         Command::Chat { command } => {
-            let (client, id) = client(&config, args)?;
+            if matches!(command, ChatCommand::New { .. })
+                && crate::browser_auth::selected(&config, args)
+            {
+                crate::browser_auth::prepare(&config, args).await?;
+            }
+            let (client, id) = client(&config, args).await?;
             match command {
                 ChatCommand::New {
                     name,
@@ -620,6 +703,7 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
                     json,
                     max_duration_ms,
                 } => {
+                    let human = client.is_human();
                     if message.as_ref().is_some_and(|text| text.trim().is_empty()) {
                         bail!("prompt must not be empty")
                     }
@@ -627,27 +711,46 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
                         .clone()
                         .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
                     let key = thread_key(&id, &name)?;
-                    client
-                        .create_session(
-                            &key,
-                            CreateSessionRequest {
-                                harness_type: (*harness).into(),
-                                persona_id: persona.clone(),
-                                metadata: Some(json!({"source":"terminal", "name": name})),
-                                on_harness_conflict: None,
-                                principal: config["principal"].as_str().map(str::to_owned),
-                            },
-                        )
-                        .await
-                        .map_err(creation_error)?;
+                    if human {
+                        let request = CreateSessionRequest {
+                            harness_type: (*harness).into(),
+                            persona_id: persona.clone(),
+                            metadata: None,
+                            on_harness_conflict: None,
+                            principal: None,
+                        };
+                        client
+                            .create_session(&key, request)
+                            .await
+                            .map_err(creation_error)?;
+                    } else {
+                        client
+                            .create_session(
+                                &key,
+                                CreateSessionRequest {
+                                    harness_type: (*harness).into(),
+                                    persona_id: persona.clone(),
+                                    metadata: Some(json!({"source":"terminal","name":name})),
+                                    on_harness_conflict: None,
+                                    principal: config["principal"].as_str().map(str::to_owned),
+                                },
+                            )
+                            .await
+                            .map_err(creation_error)?;
+                    }
                     eprintln!("session={name} thread_key={key} (create or reuse)");
                     if let Some(text) = message {
                         let request = Uuid::new_v4().to_string();
                         eprintln!(
                             "request_id={request} (reuse with chat send to retry this exact prompt)"
                         );
-                        let execution =
-                            send_message(&client, &key, text, &request, *max_duration_ms).await?;
+                        let execution = if human {
+                            client
+                                .submit_human_turn(&key, text, &request, *max_duration_ms)
+                                .await?
+                        } else {
+                            send_message(&client, &key, text, &request, *max_duration_ms).await?
+                        };
                         print_receipt(&execution, &request, *json)?;
                     }
                     if !detach {
@@ -659,7 +762,11 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
                     if !json {
                         println!("NAME\tHARNESS\tSTATUS\tLAST ACTIVITY");
                     }
-                    let prefix = format!("api:{id}:");
+                    let prefix = if client.is_human() {
+                        format!("personal:{id}:")
+                    } else {
+                        format!("api:{id}:")
+                    };
                     let mut after = String::new();
                     loop {
                         let page = client.list_sessions_with_archived(&after, *all).await?;
@@ -697,11 +804,19 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
                     }
                 }
                 ChatCommand::Prune { yes } => {
-                    let prefix = format!("api:{id}:");
+                    let prefix = if client.is_human() {
+                        format!("personal:{id}:")
+                    } else {
+                        format!("api:{id}:")
+                    };
                     let mut after = String::new();
                     let (mut matched, mut deleted, mut skipped, mut failed) = (0, 0, 0, 0);
                     loop {
-                        let page = match client.list_prunable_sessions(&after).await {
+                        let page = match if client.is_human() {
+                            client.list_human_prunable_sessions(&after).await
+                        } else {
+                            client.list_prunable_sessions(&after).await
+                        } {
                             Ok(page) => page,
                             Err(error) => {
                                 failed += 1;
@@ -731,7 +846,11 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
                             matched += 1;
                             println!("{name:?}\t{}", item["updated_at"]);
                             if *yes {
-                                match client.prune_session(&key).await {
+                                match if client.is_human() {
+                                    client.prune_human_session(&key).await
+                                } else {
+                                    client.prune_session(&key).await
+                                } {
                                     Ok(result) => match result["deleted"].as_bool() {
                                         Some(true) => deleted += 1,
                                         Some(false) => skipped += 1,
@@ -792,14 +911,14 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
                         .clone()
                         .unwrap_or_else(|| Uuid::new_v4().to_string());
                     eprintln!("request_id={request} (reuse to retry this exact prompt)");
-                    let execution = send_message(
-                        &client,
-                        &thread_key(&id, name)?,
-                        message,
-                        &request,
-                        *max_duration_ms,
-                    )
-                    .await?;
+                    let key = thread_key(&id, name)?;
+                    let execution = if client.is_human() {
+                        client
+                            .submit_human_turn(&key, message, &request, *max_duration_ms)
+                            .await?
+                    } else {
+                        send_message(&client, &key, message, &request, *max_duration_ms).await?
+                    };
                     print_receipt(&execution, &request, *json)?;
                 }
                 ChatCommand::Status { name, json } => {
@@ -820,26 +939,38 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
                     }
                     println!("Agent output: use chat logs {name} (retained durable events).");
                 }
-                ChatCommand::Interrupt { name } => println!(
-                    "{}",
-                    client.interrupt_session(&thread_key(&id, name)?).await?
-                ),
+                ChatCommand::Interrupt { name } => {
+                    let key = thread_key(&id, name)?;
+                    let result = if client.is_human() {
+                        client.interrupt_human_session(&key).await?
+                    } else {
+                        client.interrupt_session(&key).await?
+                    };
+                    println!("{result}");
+                }
                 ChatCommand::Release { name, yes } => {
                     if !yes {
                         bail!(
                             "release destroys workspace and native Pi state, but keeps transcript/events; pass --yes"
                         )
                     }
-                    println!("{}", client.release_sandbox(&thread_key(&id, name)?).await?);
+                    let key = thread_key(&id, name)?;
+                    let result = if client.is_human() {
+                        client.release_human_sandbox(&key).await?
+                    } else {
+                        client.release_sandbox(&key).await?
+                    };
+                    println!("{result}");
                 }
                 ChatCommand::Archive { name } | ChatCommand::Unarchive { name } => {
                     let archived = matches!(command, ChatCommand::Archive { .. });
-                    println!(
-                        "{}",
-                        client
-                            .archive_session(&thread_key(&id, name)?, archived)
-                            .await?
-                    );
+                    let key = thread_key(&id, name)?;
+                    let result = if client.is_human() {
+                        client.archive_human_session(&key, archived).await?
+                    } else {
+                        client.archive_session(&key, archived).await?
+                    };
+                    println!("{result}");
                 }
                 ChatCommand::Delete { name, yes } => {
                     if !yes {
@@ -847,7 +978,13 @@ pub(crate) async fn run(command: &Command, args: &Args) -> Result<()> {
                             "delete permanently destroys transcript, events, workspace and native harness state; pass --yes"
                         )
                     }
-                    println!("{}", client.delete_session(&thread_key(&id, name)?).await?);
+                    let key = thread_key(&id, name)?;
+                    let result = if client.is_human() {
+                        client.delete_human_session(&key).await?
+                    } else {
+                        client.delete_session(&key).await?
+                    };
+                    println!("{result}");
                 }
                 ChatCommand::Logs {
                     name,
@@ -935,6 +1072,11 @@ pub(crate) async fn send_message(
 ) -> Result<ExecuteSessionResponse> {
     if text.trim().is_empty() || request_id.trim().is_empty() || max_duration_ms == 0 {
         bail!("prompt and request ID must not be empty, and max duration must be positive")
+    }
+    if client.is_human() {
+        return Ok(client
+            .submit_human_turn(key, text, request_id, max_duration_ms)
+            .await?);
     }
     client
         .append_messages(

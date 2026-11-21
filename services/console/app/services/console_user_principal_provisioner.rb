@@ -1,6 +1,7 @@
 require "digest"
 
 class ConsoleUserPrincipalProvisioner
+  class IdentityConflict < StandardError; end
   USER_MCP_ROLE_FOREIGN_ID = "user-mcp".freeze
 
   def self.call(user)
@@ -12,8 +13,13 @@ class ConsoleUserPrincipalProvisioner
   end
 
   def call
-    Principal.transaction do
-      principal = Principal.find_or_initialize_by(foreign_id: foreign_id)
+    user.with_lock do
+      linked = Principal.where(kind: "console_user", console_user: user).order(:id).limit(2).to_a
+      raise IdentityConflict, "multiple personal principals require operator reconciliation" if linked.length > 1
+      principal = linked.first || Principal.find_or_initialize_by(foreign_id: foreign_id)
+      if principal.persisted? && (principal.kind != "console_user" || principal.console_user_id != user.id)
+        raise IdentityConflict, "personal principal conflicts with another identity"
+      end
       newly_created = principal.new_record?
       principal.created_by ||= user
       principal.name = user.name.presence || user.email

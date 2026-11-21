@@ -45,14 +45,28 @@ centaur config set client-id "$CENTAUR_CLIENT_ID"
 ```
 
 ```bash
-centaur login
+centaur login --auth-mode machine
 ```
 
 Login prompts without echo, verifies the secret with `/oauth/token`, and saves it in `~/.config/centaur/config.json` with permissions **0600**. This is a protected local file, not encrypted storage. Use a protected device/account and disk encryption. `CENTAUR_CONFIG` overrides the path; otherwise `XDG_CONFIG_HOME` is honored. Atomic config replacement uses a mode-0600 temporary file beside the config so the rename stays on the same filesystem.
 
 A secret manager can pipe the secret to `centaur login --secret-stdin`, or inject `CENTAUR_CLIENT_SECRET` without writing it to the config. Never put secrets in CLI arguments. Endpoint/client changes invalidate saved credentials; an environment endpoint override cannot silently reuse a credential saved for another endpoint. HTTP is accepted only on loopback for local tests; redirects are not followed.
 
-Access tokens stay in memory. The client reacquires expiring tokens using the saved client secret, retries a rejected token once, and resumes SSE with the last event ID. Revoked credentials/scopes fail visibly instead of retrying forever. This is machine-client login, not a browser/user OAuth flow. Legacy `CENTAUR_API_TOKEN` is still accepted, but cannot be renewed; session discovery requires an API-client identity.
+Access tokens stay in memory. The client reacquires expiring tokens using the saved client secret, retries a rejected token once, and resumes SSE with the last event ID. Revoked credentials/scopes fail visibly instead of retrying forever. This is the machine-client path, retained for automation and compatibility. Legacy `CENTAUR_API_TOKEN` is still accepted, but cannot be renewed; session discovery requires an API-client identity.
+
+### Browser login for people
+
+For the interactive human CLI, use the Console HTTPS URL instead of configuring a machine client:
+
+```bash
+centaur login --server https://console.example.com
+centaur auth status
+centaur chat new --name project --message "Review the project"
+```
+
+The CLI opens Console sign-in and receives a short-lived code through a loopback callback. It stores the rotating refresh credential in the same mode-0600 config file. The browser login grants ordinary personal chat/integration access; Console administrators may separately consent to CLI administration. Admin actions still check current administrator status. Use `centaur auth connections list` and `centaur auth connections revoke <UUID>` to manage other devices. `centaur logout` revokes this connection and removes the local browser credential; it does not cancel accepted work or other connections.
+
+First chat creation prepares/links the personal Console principal for the signed-in user. This is an explicit account-bound operation, not a generic admin action; ambiguous or conflicting existing principals require Console operator reconciliation. Existing machine credentials remain available with `--auth-mode machine`; operator-key administration remains available with `--auth-mode operator`. These identities never silently override the browser identity. The CLI browser protocol is fork-specific and must be enabled/configured by the Console/API operator. In the Helm chart, set `cliAuth.enabled=true`, `cliAuth.sessionResource` to the externally reachable HTTPS api-rs resource URL (ending in `/api/cli/v1`), and `console.publicUrl` to the canonical HTTPS Console URL. Create the Secrets named by `cliAuth.signingKeySecretName` and `cliAuth.verificationKeysSecretName`; the first must contain `private.pem` as a PEM RSA private key, and the second `keys.json` as `{ "cli-v1": { "n": "<base64url modulus>", "e": "AQAB" } }`. Keep the private key only in the Console Secret; api-rs receives only the public key. Provision both Secrets using the deployment's existing secret manager, never Helm values or Git plaintext. api-rs also needs read access to Console `users`, `principals`, and `cli_oauth_refresh_tokens` in its configured Console database. The Console migration creates OAuth tables. The browser endpoints stay disabled unless `cliAuth.enabled` is set.
 
 Optional `centaur config set principal <attached-principal>` selects another attached principal for new sessions. It does not alter an existing session's principal. `centaur config unset principal` restores default selection for new sessions.
 
@@ -68,7 +82,7 @@ centaur logout
 
 `config show` prints only allowed non-secret settings, their sources and credential presence; it makes no network requests. Endpoint precedence is `--api-url`, then `CENTAUR_API_URL`, then saved config. `CENTAUR_CLIENT_ID` and `CENTAUR_CLIENT_SECRET` override their saved values. `CENTAUR_API_TOKEN` selects legacy bearer authentication. Principal selection comes from saved config, not an environment variable.
 
-`config unset endpoint` and `config unset client-id` also invalidate the saved credential. `logout` removes the saved secret and its endpoint/client binding, but keeps other settings. It does **not** revoke credentials on the server, stop work, or remove credentials injected through arguments/environment. No browser SSO or automatic principal provisioning is performed.
+`config unset endpoint` and `config unset client-id` also invalidate the saved credential. Machine-mode `logout` removes the saved secret and its endpoint/client binding, but keeps other settings. It does **not** revoke machine credentials on the server, stop work, or remove credentials injected through arguments/environment. Browser-mode logout revokes its CLI connection.
 
 Use separate `CENTAUR_CONFIG` files for separate installations rather than repeatedly replacing credentials:
 
@@ -82,12 +96,12 @@ The original root execution flags still work when no subcommand is used. Mixing 
 
 ## Console administration
 
-Use `centaur admin` only with an authorized Console **operator API key**, whose owner must remain an active administrator. This is not a chat API-client secret, Keycloak token, sandbox token or Console browser cookie. The Console operator endpoint must be reachable through your deployment's existing administrative access policy; these commands do not expose it publicly or change ingress.
+Use `centaur admin` with the consented browser identity when available, or explicitly select `--auth-mode operator` for an authorized Console **operator API key**, whose owner must remain an active administrator. This is not a chat API-client secret, Keycloak token, sandbox token or Console browser cookie. The Console operator endpoint must be reachable through your deployment's existing administrative access policy; these commands do not expose it publicly or change ingress.
 
 ```bash
 centaur admin config set endpoint https://console.example.com
-centaur admin login
-centaur admin status --json
+centaur admin login --auth-mode operator
+centaur admin status --auth-mode operator --json
 centaur admin config show
 ```
 

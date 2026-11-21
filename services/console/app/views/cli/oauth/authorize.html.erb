@@ -1,0 +1,16 @@
+<% content_for :title, "Authorize Centaur CLI" %>
+<section class="oauth-card" aria-labelledby="cli-title">
+  <h1 id="cli-title">Authorize Centaur CLI</h1>
+  <p>Signed in as <%= @signed_in_email %>. Allow this local application to manage your conversations and integrations. Accepted work can continue after you disconnect.</p>
+  <p>Only continue if you started this login in your terminal.</p>
+  <%= form_with url: "/cli/oauth/authorize", method: :post, class: "oauth-form" do %>
+    <% @authorization_params.each do |name, value| %>
+      <%= hidden_field_tag name, value %>
+    <% end %>
+    <% if @admin %>
+      <p><%= check_box_tag :admin, "1", false %> <%= label_tag :admin, "Also allow administration using my current administrator permissions" %></p>
+    <% end %>
+    <%= button_tag "Deny", name: "decision", value: "deny", class: "oauth-button oauth-button-outline" %>
+    <%= button_tag "Allow", name: "decision", value: "approve", class: "oauth-button oauth-button-primary" %>
+  <% end %>
+</section>

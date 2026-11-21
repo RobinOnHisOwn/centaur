@@ -21,11 +21,19 @@ use crate::types::{
     ExecuteSessionResponse,
 };
 
+/// Supplies renewable human tokens without exposing the CLI credential store to the API library.
+pub trait AccessTokenSource: Send + Sync {
+    fn token(
+        &self,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<String, ClientError>> + Send + '_>>;
+}
+
 #[derive(Clone)]
 pub struct CentaurClient {
     client: HttpClient,
     base_url: String,
     oauth: Option<Arc<OAuthCredentials>>,
+    user_tokens: Option<Arc<dyn AccessTokenSource>>,
 }
 
 struct OAuthCredentials {
@@ -62,6 +70,7 @@ impl CentaurClient {
             client,
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             oauth: None,
+            user_tokens: None,
         }
     }
 
@@ -85,11 +94,89 @@ impl CentaurClient {
         Ok(result)
     }
 
+    pub fn with_user_tokens(
+        resource: String,
+        tokens: Arc<dyn AccessTokenSource>,
+    ) -> Result<Self, ClientError> {
+        let mut client = Self::with_client_credentials(&resource, String::new(), String::new())?;
+        client.oauth = None;
+        client.user_tokens = Some(tokens);
+        Ok(client)
+    }
+
+    pub fn is_human(&self) -> bool {
+        self.user_tokens.is_some()
+    }
+
+    fn api_url(&self, path: &str) -> String {
+        if self.is_human() {
+            format!(
+                "{}/{}",
+                self.base_url,
+                path.strip_prefix("api/").unwrap_or(path)
+            )
+        } else {
+            format!("{}/{}", self.base_url, path)
+        }
+    }
+
+    pub async fn human_identity(&self) -> Result<Value, ClientError> {
+        Ok(self
+            .send(self.client.get(format!("{}/me", self.base_url)))
+            .await?
+            .json()
+            .await?)
+    }
+
+    pub async fn human_action(
+        &self,
+        key: &ThreadKey,
+        action: &str,
+        body: Option<Value>,
+    ) -> Result<Value, ClientError> {
+        let path = match action {
+            "interrupt" => format!("{}/interrupt", self.session_url(key)),
+            "release" => format!("{}/sandbox", self.session_url(key)),
+            "archive" => format!("{}/archive", self.session_url(key)),
+            "delete" => self.session_url(key),
+            "prune" => format!("{}/prune", self.session_url(key)),
+            _ => return Err(ClientError::InvalidUserAction),
+        };
+        let request = if action == "delete" || action == "prune" {
+            self.client.delete(path)
+        } else {
+            self.client.post(path)
+        };
+        let request = if let Some(body) = body {
+            request.json(&body)
+        } else {
+            request
+        };
+        self.send(request).await?.json().await.map_err(Into::into)
+    }
+
+    pub async fn submit_human_turn(
+        &self,
+        key: &ThreadKey,
+        text: &str,
+        request_id: &str,
+        duration: u64,
+    ) -> Result<ExecuteSessionResponse, ClientError> {
+        self.post_json(
+            &format!("{}/turn", self.session_url(key)),
+            &json!({"message":text,"request_id":request_id,"max_duration_ms":duration}),
+        )
+        .await
+    }
+
     pub async fn authenticate(&self) -> Result<(), ClientError> {
         self.access_token().await.map(|_| ())
     }
 
     async fn access_token(&self) -> Result<Option<String>, ClientError> {
+        if let Some(tokens) = &self.user_tokens {
+            return tokens.token().await.map(Some);
+        }
         let Some(auth) = &self.oauth else {
             return Ok(None);
         };
@@ -169,8 +256,56 @@ impl CentaurClient {
         after: &str,
         include_archived: bool,
     ) -> Result<Value, ClientError> {
+        if self.is_human() {
+            return Ok(self
+                .send(self.client.get(format!(
+                    "{}?after_thread_key={}&include_archived={}",
+                    self.base_url,
+                    urlencoding::encode(after),
+                    include_archived
+                )))
+                .await?
+                .json()
+                .await?);
+        }
         self.list_sessions_filtered(after, include_archived, false)
             .await
+    }
+    pub async fn list_human_prunable_sessions(&self, after: &str) -> Result<Value, ClientError> {
+        Ok(self
+            .send(self.client.get(format!(
+                "{}?after_thread_key={after}&prunable_only=true",
+                self.base_url
+            )))
+            .await?
+            .json()
+            .await?)
+    }
+    pub async fn interrupt_human_session(&self, key: &ThreadKey) -> Result<Value, ClientError> {
+        let state = self.session_state(key).await?;
+        if let Some(id) = state["execution"]["execution_id"].as_str() {
+            self.human_action(key, "interrupt", Some(json!({"execution_id":id})))
+                .await
+        } else {
+            Ok(json!({"interrupted":false,"execution_id":null}))
+        }
+    }
+    pub async fn release_human_sandbox(&self, key: &ThreadKey) -> Result<Value, ClientError> {
+        self.human_action(key, "release", None).await
+    }
+    pub async fn archive_human_session(
+        &self,
+        key: &ThreadKey,
+        archived: bool,
+    ) -> Result<Value, ClientError> {
+        self.human_action(key, "archive", Some(json!({"archived":archived})))
+            .await
+    }
+    pub async fn delete_human_session(&self, key: &ThreadKey) -> Result<Value, ClientError> {
+        self.human_action(key, "delete", None).await
+    }
+    pub async fn prune_human_session(&self, key: &ThreadKey) -> Result<Value, ClientError> {
+        self.human_action(key, "prune", None).await
     }
 
     pub async fn list_prunable_sessions(&self, after: &str) -> Result<Value, ClientError> {
@@ -187,8 +322,8 @@ impl CentaurClient {
             .send(
                 self.client
                     .get(format!(
-                        "{}/api/sessions?after_thread_key={}&include_archived={}&prunable_only={}",
-                        self.base_url,
+                        "{}?after_thread_key={}&include_archived={}&prunable_only={}",
+                        self.api_url("api/sessions"),
                         urlencoding::encode(after),
                         include_archived,
                         prunable_only
@@ -201,6 +336,18 @@ impl CentaurClient {
     }
 
     pub async fn interrupt_session(&self, key: &ThreadKey) -> Result<Value, ClientError> {
+        if self.is_human() {
+            let state = self.session_state(key).await?;
+            if let Some(id) = state["execution"]["execution_id"].as_str() {
+                return self
+                    .post_json(
+                        &format!("{}/interrupt", self.session_url(key)),
+                        &json!({"execution_id":id}),
+                    )
+                    .await;
+            }
+            return Ok(json!({"interrupted":false,"execution_id":null}));
+        }
         self.post_json(
             &format!("{}/interrupt", self.session_url(key)),
             &json!({"reason":"Interrupted from terminal"}),
@@ -212,7 +359,7 @@ impl CentaurClient {
         Ok(self
             .send(
                 self.client
-                    .get(format!("{}/api/mcp/servers", self.base_url))
+                    .get(self.api_url("api/mcp/servers"))
                     .timeout(Duration::from_secs(30)),
             )
             .await?
@@ -224,15 +371,15 @@ impl CentaurClient {
         &self,
         server: &centaur_session_core::mcp::McpServer,
     ) -> Result<Value, ClientError> {
-        self.post_json(&format!("{}/api/mcp/servers", self.base_url), server)
+        self.post_json(&self.api_url("api/mcp/servers"), server)
             .await
     }
 
     pub async fn login_mcp_server(&self, name: &str) -> Result<Value, ClientError> {
         self.post_json(
             &format!(
-                "{}/api/mcp/servers/{}/login",
-                self.base_url,
+                "{}/{}/login",
+                self.api_url("api/mcp/servers"),
                 urlencoding::encode(name)
             ),
             &json!({}),
@@ -415,8 +562,8 @@ impl CentaurClient {
 
     fn session_url(&self, thread_key: &ThreadKey) -> String {
         format!(
-            "{}/api/session/{}",
-            self.base_url,
+            "{}/{}",
+            self.api_url("api/session"),
             urlencoding::encode(thread_key.as_str())
         )
     }
@@ -461,8 +608,14 @@ pub enum ClientError {
     EventStream(String),
     #[error("bearer token cannot be represented as an HTTP header")]
     InvalidBearerToken,
+    #[error("unsupported human CLI action")]
+    InvalidUserAction,
     #[error("Centaur authentication failed (HTTP {0}); check API client configuration")]
     Authentication(StatusCode),
+    #[error(
+        "Browser credential refresh failed; run centaur auth status or centaur login (no credential fallback)"
+    )]
+    UserAuthentication,
     #[error("Centaur returned an invalid token response")]
     InvalidTokenResponse,
 }
